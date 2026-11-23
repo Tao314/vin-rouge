@@ -120,7 +120,7 @@ def main():
         _, pays = c.call("GET", "/api/payables")
         check("老应付完好(¥1200)", len(pays) == 1 and pays[0]["amount_cents"] == 120000, str(pays))
         _, me = c.call("GET", "/api/me")
-        check("版本已升 v0.2.0", me.get("version") == "v0.2.0", str(me))
+        check("版本已升 v0.3.0", me.get("version") == "v0.3.0", str(me))
 
         w1 = [p for p in prods if p["name"] == "老酒甲"][0]
         acc = [p for p in prods if p["name"] == "礼品袋"][0]

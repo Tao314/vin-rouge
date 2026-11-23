@@ -41,5 +41,5 @@ sleep 2
 systemctl --no-pager status wine-system || true
 echo
 echo "Service listening on 127.0.0.1:9000. Put Nginx/Caddy in front for public HTTPS access."
-echo "首次启动的管理员初始密码见 $APP_DIR/data/INITIAL_PASSWORD.txt (登录后立即改密并删除该文件)。"
+echo "全新安装: 打开页面注册第一个账号即自动成为管理员; 老库升级/设了 WINE_ADMIN_PASSWORD 时管理员 allen314 初始密码见 $APP_DIR/data/INITIAL_PASSWORD.txt (登录后立即改密并删除该文件)。"
 echo "Quick check: curl -s http://127.0.0.1:9000/api/me"

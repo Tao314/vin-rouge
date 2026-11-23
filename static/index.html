@@ -79,7 +79,7 @@ async function api(path,opt={}){
 }
 async function busy(btn,fn){
   const old=btn.textContent; btn.disabled=true; btn.textContent="处理中…";
-  try{await fn()}catch(e){alert(e.message)}finally{btn.disabled=false;btn.textContent=old}
+  try{await fn()}catch(e){alert(e.message)}finally{btn.disabled=false;btn.textContent=btn.dataset.label||old}
 }
 function loading(v){v.innerHTML='<div class="loading">加载中…</div>'}
 async function loadBase(){
@@ -140,30 +140,55 @@ async function vIn(v){
     <div class="grid2"><div><label>运费(元,没有填0;按金额比例分摊进成本)</label><input id="p-freight" inputmode="decimal" value="0"></div>
     <div><label>付款状态(采购入库)</label><select id="p-pay"><option>未付款</option><option>已付款</option></select></div></div>
     <label>备注</label><input id="p-note">
-    <div style="margin-top:12px"><button class="btn" id="p-submit" style="width:100%">确认入库</button></div>
+    <div style="margin-top:12px"><button class="btn" id="p-submit" style="width:100%">确认入库</button>
+    <button class="btn sec" id="p-cancel-edit" style="width:100%;margin-top:6px;display:none">取消修改</button></div>
     <div class="ok" id="p-ok"></div><div class="err" id="p-err"></div>`;
   const listCard=el("div","card",`<b>入库单</b><div id="p-list" class="loading">加载中…</div>`);
   v.replaceChildren(card,listCard);
   const linesBox=card.querySelector("#p-lines");
-  function addLine(){
+  function addLine(data){
     const d=el("div","line");
     d.innerHTML=`<div class="grid3"><div><label>商品</label><select class="ln-p">${DATA.products.map(p=>`<option value="${p.id}">${esc(prodLabel(p))}(${esc(p.type)})</option>`).join("")}</select></div>
       <div><label>数量</label><input class="ln-q" type="number" min="1" value="1"></div>
       <div><label>进价(元/件)</label><input class="ln-u" inputmode="decimal" value="0"></div></div>
       <button class="btn sm sec ln-del" style="margin-top:6px">删此行</button>`;
     d.querySelector(".ln-del").onclick=()=>d.remove();
+    if(data){d.querySelector(".ln-p").value=data.product_id;d.querySelector(".ln-q").value=data.qty;d.querySelector(".ln-u").value=String(data.unit_price_cents/100)}
     linesBox.appendChild(d);
   }
   addLine();
-  card.querySelector("#p-add").onclick=addLine;
+  card.querySelector("#p-add").onclick=()=>addLine();
+  let pRows=[];
+  function setEditMode(o){
+    const btn=card.querySelector("#p-submit"), cancelBtn=card.querySelector("#p-cancel-edit");
+    if(o){
+      card.dataset.editId=o.id; btn.textContent="保存修改"; btn.dataset.label="保存修改"; cancelBtn.style.display="block";
+      const typeSel=card.querySelector("#p-type"); typeSel.value=o.type; typeSel.disabled=true;
+      card.querySelector("#p-date").value=o.biz_date;
+      card.querySelector("#p-sup").value=o.supplier_id||"";
+      card.querySelector("#p-wh").value=o.warehouse_id;
+      card.querySelector("#p-freight").value=String(o.freight_cents/100);
+      card.querySelector("#p-pay").value=o.pay_status||"未付款";
+      card.querySelector("#p-note").value=o.note||"";
+      linesBox.replaceChildren(); o.lines.forEach(addLine);
+      card.scrollIntoView({behavior:"smooth"});
+    }else{
+      delete card.dataset.editId; btn.textContent="确认入库"; btn.dataset.label="确认入库"; cancelBtn.style.display="none";
+      card.querySelector("#p-type").disabled=false;
+      linesBox.replaceChildren(); addLine();
+    }
+  }
+  card.querySelector("#p-cancel-edit").onclick=()=>setEditMode(null);
   async function refreshList(){
     const box=listCard.querySelector("#p-list");
     try{
-      const rows=await api("/api/purchase-orders");
+      const rows=await api("/api/purchase-orders"); pRows=rows;
       box.className=""; box.innerHTML=rows.length?rows.map(o=>`<div class="line"><div class="row"><b>${esc(o.order_no)}</b><span class="pill ${o.status==="已作废"?"gray":""}">${esc(o.status)}</span></div>
         <div class="small">${esc(o.type)} · ${esc(o.biz_date)} · ${esc(o.supplier_name||"—")} → ${esc(o.warehouse_name)} · 货款 ${money(o.goods_cents)} + 运费 ${money(o.freight_cents)} = <b>${money(o.total_cents)}</b>${o.type==="采购入库"?" · "+esc(o.pay_status||"未付款"):""}</div>
         <div class="small">${o.lines.map(l=>`${esc(l.product_name)}×${l.qty}@${money(l.unit_price_cents)}`).join("、")}</div>
-        ${o.status!=="已作废"?`<button class="btn sm sec" data-cancel="${o.id}" style="margin-top:6px">作废重录</button>`:""}</div>`).join(""):"暂无入库单";
+        ${o.status!=="已作废"?`<button class="btn sm sec" data-edit="${o.id}" style="margin-top:6px">修改</button> <button class="btn sm sec" data-cancel="${o.id}" style="margin-top:6px">作废重录</button>`:""}</div>`).join(""):"暂无入库单";
+      box.querySelectorAll("[data-edit]").forEach(b=>b.onclick=()=>{
+        const o=pRows.find(x=>x.id==b.dataset.edit); if(o)setEditMode(o);});
       box.querySelectorAll("[data-cancel]").forEach(b=>b.onclick=()=>busy(b,async()=>{
         if(!confirm("作废这张单?库存和应付会冲销(已付款/已调拨的不能作废)"))return;
         await api(`/api/purchase-orders/${b.dataset.cancel}/cancel`,{method:"POST",body:"{}"});
@@ -176,6 +201,16 @@ async function vIn(v){
     const err=card.querySelector("#p-err"), ok=card.querySelector("#p-ok"); err.textContent=""; ok.textContent="";
     const lines=[...linesBox.children].map(d=>({product_id:+d.querySelector(".ln-p").value,qty:+d.querySelector(".ln-q").value,unit_price:d.querySelector(".ln-u").value||"0"}));
     try{
+      if(card.dataset.editId){
+        await api(`/api/purchase-orders/${card.dataset.editId}`,{method:"PUT",body:JSON.stringify({
+          supplier_id:card.querySelector("#p-sup").value?+card.querySelector("#p-sup").value:null,
+          warehouse_id:+card.querySelector("#p-wh").value,
+          biz_date:card.querySelector("#p-date").value,
+          freight:card.querySelector("#p-freight").value||"0",
+          pay_status:card.querySelector("#p-pay").value,
+          lines, note:card.querySelector("#p-note").value})});
+        ok.textContent="修改已保存"; setEditMode(null); refreshList(); return;
+      }
       const r=await api("/api/purchase-orders",{method:"POST",body:JSON.stringify({
         type:card.querySelector("#p-type").value,
         supplier_id:card.querySelector("#p-sup").value?+card.querySelector("#p-sup").value:null,
@@ -205,12 +240,13 @@ async function vOrders(v){
     <div><label>付款状态</label><select id="o-pay"><option>未付款</option><option>已付款</option></select></div></div>
     <label>物流号(可发货时再填)</label><input id="o-log">
     <label>备注</label><input id="o-note">
-    <div style="margin-top:12px"><button class="btn" id="o-submit" style="width:100%">生成货单</button></div>
+    <div style="margin-top:12px"><button class="btn" id="o-submit" style="width:100%">生成货单</button>
+    <button class="btn sec" id="o-cancel-edit" style="width:100%;margin-top:6px;display:none">取消修改</button></div>
     <div class="ok" id="o-ok"></div><div class="err" id="o-err"></div>`;
   const listCard=el("div","card",`<b>货单</b><div id="o-list" class="loading">加载中…</div>`);
   v.replaceChildren(card,listCard);
   const linesBox=card.querySelector("#o-lines");
-  function addLine(){
+  function addLine(data){
     const d=el("div","line");
     d.innerHTML=`<div class="grid3"><div><label>商品</label><select class="ln-p">${DATA.products.map(p=>`<option value="${p.id}">${esc(prodLabel(p))}(${esc(p.type)})</option>`).join("")}</select></div>
       <div><label>数量</label><input class="ln-q" type="number" min="1" value="1"></div>
@@ -218,14 +254,36 @@ async function vOrders(v){
       <div class="grid2"><div><label>类型</label><select class="ln-t"><option>销售</option><option>赠送</option></select></div>
       <div><button class="btn sm sec ln-del" style="margin-top:22px">删此行</button></div></div>`;
     d.querySelector(".ln-del").onclick=()=>d.remove();
+    if(data){d.querySelector(".ln-p").value=data.product_id;d.querySelector(".ln-q").value=data.qty;d.querySelector(".ln-u").value=String(data.unit_price_cents/100);d.querySelector(".ln-t").value=data.line_type}
     linesBox.appendChild(d);
   }
   addLine();
-  card.querySelector("#o-add").onclick=addLine;
+  card.querySelector("#o-add").onclick=()=>addLine();
+  let oRows=[];
+  function setEditMode(o){
+    const btn=card.querySelector("#o-submit"), cancelBtn=card.querySelector("#o-cancel-edit");
+    if(o){
+      card.dataset.editId=o.id; btn.textContent="保存修改"; btn.dataset.label="保存修改"; cancelBtn.style.display="block";
+      card.querySelector("#o-cust").value=o.customer_id;
+      card.querySelector("#o-wh").value=o.warehouse_id;
+      card.querySelector("#o-freight").value=String(o.freight_cents/100);
+      card.querySelector("#o-payer").value=o.freight_payer;
+      card.querySelector("#o-pay").disabled=true;
+      card.querySelector("#o-log").value=o.logistics_no||"";
+      card.querySelector("#o-note").value=o.note||"";
+      linesBox.replaceChildren(); o.lines.forEach(addLine);
+      card.scrollIntoView({behavior:"smooth"});
+    }else{
+      delete card.dataset.editId; btn.textContent="生成货单"; btn.dataset.label="生成货单"; cancelBtn.style.display="none";
+      card.querySelector("#o-pay").disabled=false;
+      linesBox.replaceChildren(); addLine();
+    }
+  }
+  card.querySelector("#o-cancel-edit").onclick=()=>setEditMode(null);
   async function refresh(){
     const box=listCard.querySelector("#o-list");
     try{
-      const rows=await api("/api/sales-orders");
+      const rows=await api("/api/sales-orders"); oRows=rows;
       box.className=""; box.innerHTML=rows.length?rows.map(o=>{
         const cancelled=o.order_status==="已取消";
         const st=cancelled?"已取消":`${o.ship_status} · ${o.pay_status}`;
@@ -234,10 +292,22 @@ async function vOrders(v){
         <div class="small">${o.lines.map(l=>`${esc(l.product_name)}×${l.qty}@${money(l.unit_price_cents)}${l.line_type==="赠送"?"(赠送)":""}`).join("、")}</div>
         <div class="small">物流号:${esc(o.logistics_no||"—")} · 发货时间:${esc((o.ship_time||"—").replace("T"," ").slice(0,16))}</div>
         ${cancelled?`<div class="small">取消原因:${esc(o.cancel_reason||"—")}</div>`:`<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
-          ${o.ship_status!=="已发货"?`<input id="log-${o.id}" placeholder="物流号" value="${esc(o.logistics_no||"")}" style="flex:1 1 140px"><button class="btn sm" data-ship="${o.id}">发货出库</button>`:""}
+          ${o.ship_status!=="已发货"?`<input id="log-${o.id}" placeholder="物流号" value="${esc(o.logistics_no||"")}" style="flex:1 1 140px"><button class="btn sm" data-ship="${o.id}">发货出库</button><button class="btn sm sec" data-edit="${o.id}">修改货单</button>`:`<button class="btn sm sec" data-edit-shipped="${o.id}">改物流号/备注</button>`}
           <button class="btn sm sec" data-payst="${o.id}" data-next="${o.pay_status==="已付款"?"未付款":"已付款"}">${o.pay_status==="已付款"?"改未付款":"改已付款"}</button>
           <button class="btn sm sec" data-copy="${esc(o.public_path)}">复制客户链接</button>
-          ${o.ship_status!=="已发货"?`<button class="btn sm sec" data-cancel="${o.id}">取消货单</button>`:""}</div>`}</div>`}).join(""):"暂无货单";
+          ${o.ship_status!=="已发货"?`<button class="btn sm sec" data-cancel="${o.id}">取消货单</button>`:""}</div>${o.ship_status==="已发货"?`<div class="small">已发货:明细不可改,只能改物流号/备注/付款状态</div>`:""}`}</div>`}).join(""):"暂无货单";
+      box.querySelectorAll("[data-edit]").forEach(b=>b.onclick=()=>{
+        const o=oRows.find(x=>x.id==b.dataset.edit); if(o)setEditMode(o);});
+      box.querySelectorAll("[data-edit-shipped]").forEach(b=>b.onclick=()=>busy(b,async()=>{
+        const o=oRows.find(x=>x.id==b.dataset.editShipped); if(!o)return;
+        const log=prompt("物流号:",o.logistics_no||""); if(log===null)return;
+        const note=prompt("备注:",o.note||""); if(note===null)return;
+        await api(`/api/sales-orders/${o.id}`,{method:"PUT",body:JSON.stringify({
+          customer_id:o.customer_id,warehouse_id:o.warehouse_id,biz_date:o.biz_date,
+          lines:o.lines.map(l=>({product_id:l.product_id,qty:l.qty,unit_price:String(l.unit_price_cents/100),line_type:l.line_type})),
+          freight:String(o.freight_cents/100),freight_payer:o.freight_payer,
+          logistics_no:log,note})});
+        refresh();}));
       box.querySelectorAll("[data-ship]").forEach(b=>b.onclick=()=>busy(b,async()=>{
         const log=box.querySelector(`#log-${b.dataset.ship}`).value;
         await api(`/api/sales-orders/${b.dataset.ship}/ship`,{method:"POST",body:JSON.stringify({logistics_no:log,ship_time:""})});
@@ -259,6 +329,14 @@ async function vOrders(v){
     const err=card.querySelector("#o-err"),ok=card.querySelector("#o-ok");err.textContent="";ok.textContent="";
     const lines=[...linesBox.children].map(d=>({product_id:+d.querySelector(".ln-p").value,qty:+d.querySelector(".ln-q").value,unit_price:d.querySelector(".ln-u").value||"0",line_type:d.querySelector(".ln-t").value}));
     try{
+      if(card.dataset.editId){
+        await api(`/api/sales-orders/${card.dataset.editId}`,{method:"PUT",body:JSON.stringify({
+          customer_id:+card.querySelector("#o-cust").value,warehouse_id:+card.querySelector("#o-wh").value,
+          lines,freight:card.querySelector("#o-freight").value||"0",
+          freight_payer:card.querySelector("#o-payer").value,
+          logistics_no:card.querySelector("#o-log").value,note:card.querySelector("#o-note").value})});
+        ok.textContent="修改已保存"; setEditMode(null); refresh(); return;
+      }
       const r=await api("/api/sales-orders",{method:"POST",body:JSON.stringify({
         customer_id:+card.querySelector("#o-cust").value,warehouse_id:+card.querySelector("#o-wh").value,
         biz_date:today(),lines,freight:card.querySelector("#o-freight").value||"0",
@@ -290,7 +368,33 @@ async function vTransfer(v){
     const box=listCard.querySelector("#t-list");
     try{const rows=await api("/api/transfers"); box.className="";
       box.innerHTML=rows.length?rows.map(t=>`<div class="line"><div class="row"><b>${esc(t.transfer_no)}</b><span class="small">${esc(t.biz_date)}</span></div>
-      <div class="small">${esc(t.from_name)} → ${esc(t.to_name)} · ${t.lines.map(l=>`${esc(l.product_name)}×${l.qty}(批次#${l.batch_id})`).join("、")}</div></div>`).join(""):"暂无调拨单";
+      <div class="small">${esc(t.from_name)} → ${esc(t.to_name)} · ${t.lines.map(l=>`${esc(l.product_name)}×${l.qty}(批次#${l.batch_id})`).join("、")}</div>
+      <button class="btn sm sec" data-tedit="${t.id}" style="margin-top:6px">修改</button>
+      <div id="tedit-${t.id}" style="display:none"></div></div>`).join(""):"暂无调拨单";
+      box.querySelectorAll("[data-tedit]").forEach(b=>b.onclick=()=>{
+        const t=rows.find(x=>x.id==b.dataset.tedit); const div=box.querySelector(`#tedit-${t.id}`);
+        if(div.style.display!=="none"){div.style.display="none";return}
+        const batchOpts=batches.filter(x=>x.qty_remaining>0||t.lines.some(l=>l.batch_id===x.batch_id));
+        div.innerHTML=`<div class="grid2"><div><label>调入仓</label><select class="te-to">${DATA.warehouses.map(w=>`<option value="${w.id}">${esc(w.name)}</option>`).join("")}</select></div>
+        <div><label>日期</label><input class="te-date" type="date" value="${esc(t.biz_date)}"></div></div>
+        ${t.lines.map(l=>`<div class="grid2 te-line"><div><label>批次</label><select class="te-batch">${batchOpts.map(x=>`<option value="${x.batch_id}">#${x.batch_id} ${esc(x.product_name)}${x.vintage?" "+esc(x.vintage):""} · 剩${x.qty_remaining}</option>`).join("")}</select></div>
+        <div><label>数量</label><input class="te-qty" type="number" min="1" value="${l.qty}"></div></div>`).join("")}
+        <label>备注</label><input class="te-note" value="${esc(t.note||"")}">
+        <div style="margin-top:8px"><button class="btn sm te-save">保存修改</button></div><div class="err te-err"></div>`;
+        div.querySelector(".te-to").value=t.to_warehouse_id;
+        div.querySelectorAll(".te-line").forEach((row,i)=>{row.querySelector(".te-batch").value=t.lines[i].batch_id});
+        div.style.display="block";
+        div.querySelector(".te-save").onclick=e=>busy(e.target,async()=>{
+          div.querySelector(".te-err").textContent="";
+          try{await api(`/api/transfers/${t.id}`,{method:"PUT",body:JSON.stringify({
+            to_warehouse_id:+div.querySelector(".te-to").value,
+            biz_date:div.querySelector(".te-date").value,
+            lines:[...div.querySelectorAll(".te-line")].map(row=>({batch_id:+row.querySelector(".te-batch").value,qty:+row.querySelector(".te-qty").value})),
+            note:div.querySelector(".te-note").value})});
+            refresh();
+          }catch(ex){div.querySelector(".te-err").textContent=ex.message}
+        });
+      });
     }catch(e){box.className="err";box.textContent=e.message}
   }
   refresh();
@@ -318,8 +422,26 @@ async function vPay(v){
     body.className=""; body.innerHTML=`<div class="small" style="margin:6px 0">未付合计 <b>${money(due)}</b></div>`+(rows.length?rows.map(r=>`<div class="line">
       <div class="row"><b>${esc(r.supplier_name)}</b><span class="pill ${r.balance_cents?"":"gray"}">${r.balance_cents?"未付 "+money(r.balance_cents):"已付清"}</span></div>
       <div class="small">${esc(r.order_no)} · ${esc(r.biz_date)} · 应付 ${money(r.amount_cents)} · 已付 ${money(r.paid_cents)}</div>
-      ${r.payments.map(p=>`<div class="small">↳ ${esc(p.pay_date)} 付 ${money(p.amount_cents)} ${esc(p.note)}</div>`).join("")}
+      ${r.payments.map(p=>`<div class="small">↳ ${esc(p.pay_date)} 付 ${money(p.amount_cents)} ${esc(p.note)} <button class="btn sm sec" data-pedit="${p.id}" data-amt="${p.amount_cents}" data-date="${esc(p.pay_date)}" data-note="${esc(p.note||"")}">修改</button></div><div id="pedit-${p.id}" style="display:none"></div>`).join("")}
       ${r.balance_cents?`<div class="grid2" style="margin-top:6px"><input id="amt-${r.id}" inputmode="decimal" placeholder="付款金额(元)"><button class="btn sm" data-pay="${r.id}">登记付款</button></div>`:""}</div>`).join(""):"暂无应付(期初库存不产生应付)");
+    body.querySelectorAll("[data-pedit]").forEach(b=>b.onclick=()=>{
+      const div=body.querySelector(`#pedit-${b.dataset.pedit}`);
+      if(div.style.display!=="none"){div.style.display="none";return}
+      div.innerHTML=`<div class="grid3"><div><label>金额(元)</label><input class="pe-amt" inputmode="decimal" value="${String(+b.dataset.amt/100)}"></div>
+      <div><label>日期</label><input class="pe-date" type="date" value="${esc(b.dataset.date)}"></div>
+      <div><label>备注</label><input class="pe-note" value="${esc(b.dataset.note)}"></div></div>
+      <div style="margin-top:8px"><button class="btn sm pe-save">保存修改</button></div><div class="err pe-err"></div>`;
+      div.style.display="block";
+      div.querySelector(".pe-save").onclick=e=>busy(e.target,async()=>{
+        div.querySelector(".pe-err").textContent="";
+        try{await api(`/api/payments/${b.dataset.pedit}`,{method:"PUT",body:JSON.stringify({
+          amount:div.querySelector(".pe-amt").value||"0",
+          pay_date:div.querySelector(".pe-date").value,
+          note:div.querySelector(".pe-note").value})});
+          vPay(v);
+        }catch(ex){div.querySelector(".pe-err").textContent=ex.message}
+      });
+    });
     body.querySelectorAll("[data-pay]").forEach(b=>b.onclick=()=>busy(b,async()=>{
       const amt=body.querySelector(`#amt-${b.dataset.pay}`).value;
       await api(`/api/payables/${b.dataset.pay}/payments`,{method:"POST",body:JSON.stringify({amount:amt,pay_date:today(),note:""})});
@@ -332,27 +454,44 @@ async function vPay(v){
 async function vBase(v){
   loading(v); await loadBase();
   const wrap=el("div");
-  function section(title,items,formHtml,onAdd,fmt){
+  function section(title,items,formHtml,readBody,url,fmt,fill){
     const c=el("div","card",`<b>${title}</b><div>${items.length?items.map(fmt).join(""):'<div class="small">暂无</div>'}</div><div class="line">${formHtml}<button class="btn sm" style="margin-top:8px">添加</button><div class="err"></div></div>`);
-    c.querySelector("button").onclick=e=>busy(e.target,async()=>{try{await onAdd(c);vBase(v)}catch(ex){c.querySelector(".err").textContent=ex.message}});
+    c.querySelector(":scope > .line > button").onclick=e=>busy(e.target,async()=>{try{await api(url,{method:"POST",body:JSON.stringify(readBody(c))});vBase(v)}catch(ex){c.querySelector(".err").textContent=ex.message}});
+    c.querySelectorAll("[data-edit]").forEach(b=>b.onclick=()=>{
+      const item=items.find(x=>x.id==b.dataset.edit); const div=c.querySelector(`#edit-${url.split("/").pop()}-${item.id}`);
+      if(div.style.display!=="none"){div.style.display="none";return}
+      div.innerHTML=`${formHtml}<div style="margin-top:8px"><button class="btn sm">保存修改</button></div><div class="err"></div>`;
+      fill(div,item); div.style.display="block";
+      div.querySelector("button").onclick=e=>busy(e.target,async()=>{
+        try{await api(`${url}/${item.id}`,{method:"PUT",body:JSON.stringify(readBody(div))});vBase(v)}
+        catch(ex){div.querySelector(".err").textContent=ex.message}});
+    });
     wrap.appendChild(c);
   }
-  section("商品(酒/附件)",DATA.products,
-    `<div class="grid2"><div><label>类型</label><select class="f-type"><option>酒</option><option>附件</option></select></div>
+  const prodForm=`<div class="grid2"><div><label>类型</label><select class="f-type"><option>酒</option><option>附件</option></select></div>
      <div><label>名字</label><input class="f-name" placeholder="如:拉菲 / 礼品袋"></div></div>
      <div class="grid3"><div><label>种类(酒)</label><input class="f-cat" placeholder="红葡萄酒"></div>
      <div><label>年份(酒)</label><input class="f-vin" placeholder="2018"></div>
-     <div><label>原产地(酒)</label><input class="f-org" placeholder="法国波尔多"></div></div>`,
-    async c=>api("/api/products",{method:"POST",body:JSON.stringify({type:c.querySelector(".f-type").value,name:c.querySelector(".f-name").value,category:c.querySelector(".f-cat").value,vintage:c.querySelector(".f-vin").value,origin:c.querySelector(".f-org").value})}),
-    p=>`<div class="line"><b>${esc(p.name)}</b> <span class="pill gray">${esc(p.type)}</span><div class="small">${[p.category,p.vintage,p.origin].filter(Boolean).map(esc).join(" · ")}</div></div>`);
-  const partyForm=`<div class="grid2"><div><label>名字</label><input class="f-name"></div><div><label>联系人</label><input class="f-contact"></div></div><div class="grid2"><div><label>电话</label><input class="f-phone"></div><div><label>备注</label><input class="f-note"></div></div>`;
-  const partyBody=c=>({name:c.querySelector(".f-name").value,contact:c.querySelector(".f-contact").value,phone:c.querySelector(".f-phone").value,note:c.querySelector(".f-note").value});
-  const partyFmt=p=>`<div class="line"><b>${esc(p.name)}</b><div class="small">${[p.contact,p.phone,p.note].filter(Boolean).map(esc).join(" · ")}</div></div>`;
-  section("供应商",DATA.suppliers,partyForm,async c=>api("/api/suppliers",{method:"POST",body:JSON.stringify(partyBody(c))}),partyFmt);
-  section("客户",DATA.customers,partyForm,async c=>api("/api/customers",{method:"POST",body:JSON.stringify(partyBody(c))}),partyFmt);
-  section("仓库",DATA.warehouses,`<label>名字</label><input class="f-name" placeholder="如:主仓 / 家里酒柜">`,
-    async c=>api("/api/warehouses",{method:"POST",body:JSON.stringify({name:c.querySelector(".f-name").value})}),
-    w=>`<div class="line"><b>${esc(w.name)}</b></div>`);
+     <div><label>原产地(酒)</label><input class="f-org" placeholder="法国波尔多"></div></div>
+     <label>备注</label><input class="f-note">`;
+  const prodBody=c=>({type:c.querySelector(".f-type").value,name:c.querySelector(".f-name").value,category:c.querySelector(".f-cat").value,vintage:c.querySelector(".f-vin").value,origin:c.querySelector(".f-org").value,note:c.querySelector(".f-note").value});
+  section("商品(酒/附件)",DATA.products,prodForm,prodBody,"/api/products",
+    p=>`<div class="line"><b>${esc(p.name)}</b> <span class="pill gray">${esc(p.type)}</span> <button class="btn sm sec" data-edit="${p.id}">修改</button><div class="small">${[p.category,p.vintage,p.origin,p.note].filter(Boolean).map(esc).join(" · ")}</div><div id="edit-products-${p.id}" style="display:none"></div></div>`,
+    (c,p)=>{c.querySelector(".f-type").value=p.type;c.querySelector(".f-name").value=p.name;c.querySelector(".f-cat").value=p.category||"";c.querySelector(".f-vin").value=p.vintage||"";c.querySelector(".f-org").value=p.origin||"";c.querySelector(".f-note").value=p.note||""});
+  const partyForm=`<div class="grid2"><div><label>姓名</label><input class="f-name"></div><div><label>电话</label><input class="f-phone"></div></div><label>备注</label><input class="f-note">`;
+  const partyBody=c=>({name:c.querySelector(".f-name").value,phone:c.querySelector(".f-phone").value,note:c.querySelector(".f-note").value});
+  const partyFill=(c,p)=>{c.querySelector(".f-name").value=p.name;c.querySelector(".f-phone").value=p.phone||"";c.querySelector(".f-note").value=p.note||""};
+  const partyFmt=(kind)=>p=>`<div class="line"><b>${esc(p.name)}</b> <button class="btn sm sec" data-edit="${p.id}">修改</button><div class="small">${[p.phone,p.note].filter(Boolean).map(esc).join(" · ")}</div><div id="edit-${kind}-${p.id}" style="display:none"></div></div>`;
+  section("供应商",DATA.suppliers,partyForm,partyBody,"/api/suppliers",partyFmt("suppliers"),partyFill);
+  const custForm=`<div class="grid2"><div><label>姓名</label><input class="f-name"></div><div><label>电话</label><input class="f-phone"></div></div><label>地址</label><input class="f-address"><label>备注</label><input class="f-note">`;
+  const custBody=c=>({name:c.querySelector(".f-name").value,phone:c.querySelector(".f-phone").value,address:c.querySelector(".f-address").value,note:c.querySelector(".f-note").value});
+  const custFill=(c,p)=>{c.querySelector(".f-name").value=p.name;c.querySelector(".f-phone").value=p.phone||"";c.querySelector(".f-address").value=p.address||"";c.querySelector(".f-note").value=p.note||""};
+  const custFmt=p=>`<div class="line"><b>${esc(p.name)}</b> <button class="btn sm sec" data-edit="${p.id}">修改</button><div class="small">${[p.phone,p.address,p.note].filter(Boolean).map(esc).join(" · ")}</div><div id="edit-customers-${p.id}" style="display:none"></div></div>`;
+  section("客户",DATA.customers,custForm,custBody,"/api/customers",custFmt,custFill);
+  const whForm=`<label>名字</label><input class="f-name" placeholder="如:主仓 / 家里酒柜"><label>备注</label><input class="f-note">`;
+  section("仓库",DATA.warehouses,whForm,c=>({name:c.querySelector(".f-name").value,note:c.querySelector(".f-note").value}),"/api/warehouses",
+    w=>`<div class="line"><b>${esc(w.name)}</b> <button class="btn sm sec" data-edit="${w.id}">修改</button>${w.note?`<div class="small">${esc(w.note)}</div>`:""}<div id="edit-warehouses-${w.id}" style="display:none"></div></div>`,
+    (c,w)=>{c.querySelector(".f-name").value=w.name;c.querySelector(".f-note").value=w.note||""});
   v.replaceChildren(wrap);
 }
 
@@ -368,7 +507,20 @@ async function vSet(v){
     <div style="margin-top:8px"><button class="btn sec" id="s-reg-btn">保存注册开关</button></div>
     <div class="ok" id="s-ok"></div><div class="err" id="s-err"></div>
     <div class="small" style="margin-top:10px">备份文件保存在服务器 data/backups/ 目录。</div>`);
-  v.replaceChildren(c);
+  const logCard=el("div","card",`<b>修改记录</b><div class="small">所有修改的改前/改后留痕</div>
+    <div style="margin-top:8px"><button class="btn sec" id="s-log-btn">查看修改记录</button></div>
+    <div id="s-log-body"></div>`);
+  v.replaceChildren(c,logCard);
+  logCard.querySelector("#s-log-btn").onclick=e=>busy(e.target,async()=>{
+    const body=logCard.querySelector("#s-log-body");
+    body.innerHTML='<div class="loading">加载中…</div>';
+    try{
+      const rows=await api("/api/edit-logs");
+      const names={product:"商品",supplier:"供应商",customer:"客户",warehouse:"仓库",purchase_order:"入库单",sales_order:"货单",transfer:"调拨单",payment:"付款记录"};
+      body.innerHTML=rows.length?rows.map(r=>`<div class="line"><div class="row"><b>${esc(names[r.entity_type]||r.entity_type)} #${r.entity_id}</b><span class="small">${esc(r.created_at.slice(0,16).replace("T"," "))} · ${esc(r.operator||"")}</span></div>
+        <details><summary class="small">改前 / 改后</summary><div class="small" style="white-space:pre-wrap;word-break:break-all">改前:${esc(r.before_json)}\n改后:${esc(r.after_json)}</div></details></div>`).join(""):'<div class="small" style="margin-top:8px">暂无修改记录</div>';
+    }catch(ex){body.innerHTML=`<div class="err">${esc(ex.message)}</div>`}
+  });
   c.querySelector("#s-pw").onclick=e=>busy(e.target,async()=>{
     c.querySelector("#s-err").textContent="";
     try{await api("/api/change-password",{method:"POST",body:JSON.stringify({old_password:c.querySelector("#s-old").value,new_password:c.querySelector("#s-new").value})});
