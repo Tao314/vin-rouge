@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>红酒进销存 · 入库</title>
+<style>
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;overflow-x:hidden}
+body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f6f6f7;color:#1c1c1e;font-size:15px}
+.wrap{max-width:760px;margin:0 auto;padding:10px 12px 40px}
+header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 0 2px}
+h1{font-size:19px;margin:0;white-space:nowrap}
+.user{font-size:13px;color:#666;white-space:nowrap}
+.user b{color:#1458c8}
+nav{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
+nav button{flex:1 1 auto;min-width:56px;padding:8px 4px;border:1px solid #d8d8dc;background:#fff;border-radius:9px;font-size:14px;cursor:pointer}
+nav button.on{background:#7a1f2b;color:#fff;border-color:#7a1f2b;font-weight:600}
+.card{background:#fff;border:1px solid #e4e4e8;border-radius:12px;padding:12px;margin:10px 0}
+.row{display:flex;justify-content:space-between;align-items:center;gap:8px}
+.small{font-size:12px;color:#777}
+.big{font-size:17px;font-weight:700}
+.btn{display:inline-block;padding:9px 14px;border:0;border-radius:9px;background:#7a1f2b;color:#fff;font-size:15px;cursor:pointer}
+.btn.sec{background:#fff;color:#333;border:1px solid #d8d8dc}
+.btn.sm{padding:5px 10px;font-size:13px}
+.btn:disabled{opacity:.55;cursor:default}
+input,select{width:100%;padding:9px;border:1px solid #d8d8dc;border-radius:9px;font-size:15px;background:#fff}
+label{display:block;font-size:13px;color:#555;margin:8px 0 4px}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+@media(max-width:480px){.grid3{grid-template-columns:1fr 1fr}}
+.line{border-top:1px dashed #e0e0e4;margin-top:10px;padding-top:10px}
+.pill{display:inline-block;padding:1px 8px;border-radius:99px;background:#f3e5e8;color:#7a1f2b;font-size:12px}
+.pill.gray{background:#eee;color:#555}
+.loading{color:#888;padding:16px;text-align:center}
+.err{color:#b00020;font-size:13px;margin-top:6px;white-space:pre-wrap}
+.ok{color:#157347;font-size:13px;margin-top:6px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td,th{padding:6px 4px;border-bottom:1px solid #f0f0f2;text-align:left;vertical-align:top}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+#login{position:fixed;inset:0;background:#f6f6f7;display:flex;align-items:flex-start;justify-content:center;padding-top:12vh;z-index:9}
+#login .card{width:min(92vw,340px)}
+footer{text-align:center;color:#999;font-size:12px;margin-top:18px}
+</style>
+</head>
+<body>
+<div id="login" style="display:none"><div class="card">
+  <div class="big">红酒进销存</div><div class="small" id="li-sub">请登录</div>
+  <label>账号</label><input id="li-user" autocomplete="username">
+  <label>密码</label><input id="li-pass" type="password" autocomplete="current-password">
+  <div style="margin-top:12px"><button class="btn" id="li-btn" style="width:100%">登录</button></div>
+  <div id="li-reg" style="display:none;margin-top:8px"><button class="btn sec" id="li-reg-btn" style="width:100%">注册新账号</button>
+  <div class="small" style="margin-top:6px">第一个注册的账号自动成为管理员</div></div>
+  <div class="err" id="li-err"></div>
+</div></div>
+
+<div class="wrap" id="main" style="display:none">
+  <header><h1>🍷 红酒进销存</h1><div class="user"><b id="uname"></b> · <a href="#" id="logout">退出</a></div></header>
+  <nav id="tabs">
+    <button data-t="stock" class="on">库存</button><button data-t="in">入库</button>
+    <button data-t="orders">货单</button><button data-t="transfer">调拨</button><button data-t="pay">应付</button>
+    <button data-t="base">档案</button><button data-t="set">设置</button>
+  </nav>
+  <div id="view"><div class="loading">加载中…</div></div>
+  <footer>红酒进销存 <span id="ver"></span></footer>
+</div>
+
+<script>
+const $=s=>document.querySelector(s), el=(t,c,h)=>{const e=document.createElement(t);if(c)e.className=c;if(h!=null)e.innerHTML=h;return e};
+const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));
+const money=c=>"¥"+(c/100).toFixed(2);
+const today=()=>new Date().toISOString().slice(0,10);
+let DATA={products:[],suppliers:[],customers:[],warehouses:[]};
+async function api(path,opt={}){
+  const r=await fetch(path,{headers:{"Content-Type":"application/json"},...opt});
+  const d=await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(d.detail||("请求失败 "+r.status));
+  return d;
+}
+async function busy(btn,fn){
+  const old=btn.textContent; btn.disabled=true; btn.textContent="处理中…";
+  try{await fn()}catch(e){alert(e.message)}finally{btn.disabled=false;btn.textContent=old}
+}
+function loading(v){v.innerHTML='<div class="loading">加载中…</div>'}
+async function loadBase(){
+  [DATA.products,DATA.suppliers,DATA.customers,DATA.warehouses]=await Promise.all(
+    [api("/api/products"),api("/api/suppliers"),api("/api/customers"),api("/api/warehouses")]);
+}
+const prodName=id=>(DATA.products.find(p=>p.id==id)||{}).name||("#"+id);
+const prodLabel=p=>p.type==="酒"&&p.vintage?`${p.name} ${p.vintage}`:p.name;
+
+/* ---------------- 库存 ---------------- */
+async function vStock(v){
+  loading(v);
+  const head=el("div","card",`<div class="row"><b>库存</b><span>
+    <button class="btn sm sec" data-v="product">按商品</button>
+    <button class="btn sm sec" data-v="warehouse">按仓库</button>
+    <button class="btn sm sec" data-v="batch">按批次</button>
+    <button class="btn sm sec" data-v="txns">流水</button></span></div><div id="stock-body" class="loading">加载中…</div>`);
+  v.replaceChildren(head);
+  const body=head.querySelector("#stock-body");
+  async function show(kind){
+    body.className="loading"; body.textContent="加载中…";
+    try{
+      if(kind==="txns"){
+        const rows=await api("/api/inventory-txns");
+        body.className=""; body.innerHTML=rows.length?`<table><tr><th>类型</th><th>商品</th><th>仓库</th><th class="num">增减</th><th>单号</th></tr>${
+          rows.map(r=>`<tr><td>${esc(r.txn_type)}</td><td>${esc(r.product_name)}<div class="small">${esc(r.created_at.slice(0,16).replace("T"," "))}</div></td><td>${esc(r.warehouse_name||"")}</td><td class="num">${r.qty_delta>0?"+":""}${r.qty_delta}</td><td class="small">${esc(r.note)}</td></tr>`).join("")}</table>`:"暂无流水";
+      }else if(kind==="batch"){
+        const rows=await api("/api/inventory?view=batch");
+        body.className=""; body.innerHTML=rows.length?rows.map(r=>`<div class="line"><div class="row"><b>${esc(r.product_name)}${r.vintage?" "+esc(r.vintage):""}</b><span class="pill">剩 ${r.qty_remaining}/${r.qty_initial}</span></div>
+          <div class="small">批次#${r.batch_id} · ${esc(r.biz_date)} · ${esc(r.supplier_name||"期初")} · 进价 ${money(r.unit_price_cents)} · 实际成本 ¥${Number(r.unit_cost).toFixed(2)}<br>存放: ${esc(r.locations||"无")}</div></div>`).join(""):"暂无批次";
+      }else if(kind==="warehouse"){
+        const rows=await api("/api/inventory?view=warehouse");
+        body.className=""; body.innerHTML=rows.length?`<table><tr><th>仓库</th><th>商品</th><th class="num">总量</th><th class="num">预定</th><th class="num">可用</th></tr>${
+          rows.map(r=>`<tr><td>${esc(r.warehouse_name)}</td><td>${esc(r.product_name)}${r.vintage?" "+esc(r.vintage):""}</td><td class="num">${r.qty}</td><td class="num">${r.reserved_qty||0}</td><td class="num">${r.available_qty??r.qty}</td></tr>`).join("")}</table>`:"暂无库存";
+      }else{
+        const rows=await api("/api/inventory?view=product");
+        const tot=rows.reduce((s,r)=>s+r.qty,0), val=rows.reduce((s,r)=>s+r.value_cents,0);
+        body.className=""; body.innerHTML=`<div class="small" style="margin:6px 0">共 ${tot} 件 · 库存成本约 ${money(Math.round(val))}</div>`+(rows.length?rows.map(r=>`<div class="line"><div class="row"><b>${esc(r.product_name)}${r.vintage?" "+esc(r.vintage):""}</b><span class="pill">可用 ${r.available_qty??r.qty} 件</span></div>
+          <div class="small">${esc(r.type)}${r.category?" · "+esc(r.category):""}${r.origin?" · "+esc(r.origin):""} · 总量 ${r.qty} · 已预定 ${r.reserved_qty||0} · 成本约 ${money(Math.round(r.value_cents))}</div></div>`).join(""):"暂无商品，先到「档案」建商品，再到「入库」录库存");
+      }
+    }catch(e){body.className="err";body.textContent=e.message}
+  }
+  head.querySelectorAll("[data-v]").forEach(b=>b.onclick=()=>show(b.dataset.v));
+  show("product");
+}
+
+/* ---------------- 入库 ---------------- */
+async function vIn(v){
+  loading(v); await loadBase();
+  const card=el("div","card");
+  card.innerHTML=`<b>新建入库单</b>
+    <div class="grid2"><div><label>单据类型</label><select id="p-type"><option>采购入库</option><option>期初库存</option></select></div>
+    <div><label>日期</label><input id="p-date" type="date" value="${today()}"></div></div>
+    <div class="grid2"><div><label>供应商(采购必填)</label><select id="p-sup"><option value="">—</option>${DATA.suppliers.map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select></div>
+    <div><label>入库仓库</label><select id="p-wh">${DATA.warehouses.map(w=>`<option value="${w.id}">${esc(w.name)}</option>`).join("")}</select></div></div>
+    <div id="p-lines"></div>
+    <button class="btn sm sec" id="p-add" style="margin-top:8px">+ 加一行</button>
+    <div class="grid2"><div><label>运费(元,没有填0;按金额比例分摊进成本)</label><input id="p-freight" inputmode="decimal" value="0"></div>
+    <div><label>付款状态(采购入库)</label><select id="p-pay"><option>未付款</option><option>已付款</option></select></div></div>
+    <label>备注</label><input id="p-note">
+    <div style="margin-top:12px"><button class="btn" id="p-submit" style="width:100%">确认入库</button></div>
+    <div class="ok" id="p-ok"></div><div class="err" id="p-err"></div>`;
+  const listCard=el("div","card",`<b>入库单</b><div id="p-list" class="loading">加载中…</div>`);
+  v.replaceChildren(card,listCard);
+  const linesBox=card.querySelector("#p-lines");
+  function addLine(){
+    const d=el("div","line");
+    d.innerHTML=`<div class="grid3"><div><label>商品</label><select class="ln-p">${DATA.products.map(p=>`<option value="${p.id}">${esc(prodLabel(p))}(${esc(p.type)})</option>`).join("")}</select></div>
+      <div><label>数量</label><input class="ln-q" type="number" min="1" value="1"></div>
+      <div><label>进价(元/件)</label><input class="ln-u" inputmode="decimal" value="0"></div></div>
+      <button class="btn sm sec ln-del" style="margin-top:6px">删此行</button>`;
+    d.querySelector(".ln-del").onclick=()=>d.remove();
+    linesBox.appendChild(d);
+  }
+  addLine();
+  card.querySelector("#p-add").onclick=addLine;
+  async function refreshList(){
+    const box=listCard.querySelector("#p-list");
+    try{
+      const rows=await api("/api/purchase-orders");
+      box.className=""; box.innerHTML=rows.length?rows.map(o=>`<div class="line"><div class="row"><b>${esc(o.order_no)}</b><span class="pill ${o.status==="已作废"?"gray":""}">${esc(o.status)}</span></div>
+        <div class="small">${esc(o.type)} · ${esc(o.biz_date)} · ${esc(o.supplier_name||"—")} → ${esc(o.warehouse_name)} · 货款 ${money(o.goods_cents)} + 运费 ${money(o.freight_cents)} = <b>${money(o.total_cents)}</b>${o.type==="采购入库"?" · "+esc(o.pay_status||"未付款"):""}</div>
+        <div class="small">${o.lines.map(l=>`${esc(l.product_name)}×${l.qty}@${money(l.unit_price_cents)}`).join("、")}</div>
+        ${o.status!=="已作废"?`<button class="btn sm sec" data-cancel="${o.id}" style="margin-top:6px">作废重录</button>`:""}</div>`).join(""):"暂无入库单";
+      box.querySelectorAll("[data-cancel]").forEach(b=>b.onclick=()=>busy(b,async()=>{
+        if(!confirm("作废这张单?库存和应付会冲销(已付款/已调拨的不能作废)"))return;
+        await api(`/api/purchase-orders/${b.dataset.cancel}/cancel`,{method:"POST",body:"{}"});
+        refreshList();
+      }));
+    }catch(e){box.className="err";box.textContent=e.message}
+  }
+  refreshList();
+  card.querySelector("#p-submit").onclick=e=>busy(e.target,async()=>{
+    const err=card.querySelector("#p-err"), ok=card.querySelector("#p-ok"); err.textContent=""; ok.textContent="";
+    const lines=[...linesBox.children].map(d=>({product_id:+d.querySelector(".ln-p").value,qty:+d.querySelector(".ln-q").value,unit_price:d.querySelector(".ln-u").value||"0"}));
+    try{
+      const r=await api("/api/purchase-orders",{method:"POST",body:JSON.stringify({
+        type:card.querySelector("#p-type").value,
+        supplier_id:card.querySelector("#p-sup").value?+card.querySelector("#p-sup").value:null,
+        warehouse_id:+card.querySelector("#p-wh").value,
+        biz_date:card.querySelector("#p-date").value,
+        freight:card.querySelector("#p-freight").value||"0",
+        pay_status:card.querySelector("#p-pay").value,
+        lines, note:card.querySelector("#p-note").value,
+        idempotency_key:card.dataset.idem||(card.dataset.idem=crypto.randomUUID())})});
+      ok.textContent=`入库成功:${r.order_no}${r.duplicated?"(重复提交,已忽略)":""}`;
+      delete card.dataset.idem; refreshList();
+    }catch(ex){err.textContent=ex.message}
+  });
+}
+
+/* ---------------- 货单 ---------------- */
+async function vOrders(v){
+  loading(v); await loadBase();
+  const card=el("div","card");
+  card.innerHTML=`<b>新建客户货单</b><div class="small">建单先预定库存(不扣),发货时才真正出库</div>
+    <div class="grid2"><div><label>客户</label><select id="o-cust">${DATA.customers.map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select></div>
+    <div><label>出库仓库</label><select id="o-wh">${DATA.warehouses.map(w=>`<option value="${w.id}">${esc(w.name)}</option>`).join("")}</select></div></div>
+    <div id="o-lines"></div>
+    <button class="btn sm sec" id="o-add" style="margin-top:8px">+ 加一行</button>
+    <div class="grid3"><div><label>运费(元)</label><input id="o-freight" inputmode="decimal" value="0"></div>
+    <div><label>运费承担</label><select id="o-payer"><option>客户付</option><option>自提无</option><option>我方代付</option></select></div>
+    <div><label>付款状态</label><select id="o-pay"><option>未付款</option><option>已付款</option></select></div></div>
+    <label>物流号(可发货时再填)</label><input id="o-log">
+    <label>备注</label><input id="o-note">
+    <div style="margin-top:12px"><button class="btn" id="o-submit" style="width:100%">生成货单</button></div>
+    <div class="ok" id="o-ok"></div><div class="err" id="o-err"></div>`;
+  const listCard=el("div","card",`<b>货单</b><div id="o-list" class="loading">加载中…</div>`);
+  v.replaceChildren(card,listCard);
+  const linesBox=card.querySelector("#o-lines");
+  function addLine(){
+    const d=el("div","line");
+    d.innerHTML=`<div class="grid3"><div><label>商品</label><select class="ln-p">${DATA.products.map(p=>`<option value="${p.id}">${esc(prodLabel(p))}(${esc(p.type)})</option>`).join("")}</select></div>
+      <div><label>数量</label><input class="ln-q" type="number" min="1" value="1"></div>
+      <div><label>单价(元)</label><input class="ln-u" inputmode="decimal" value="0"></div></div>
+      <div class="grid2"><div><label>类型</label><select class="ln-t"><option>销售</option><option>赠送</option></select></div>
+      <div><button class="btn sm sec ln-del" style="margin-top:22px">删此行</button></div></div>`;
+    d.querySelector(".ln-del").onclick=()=>d.remove();
+    linesBox.appendChild(d);
+  }
+  addLine();
+  card.querySelector("#o-add").onclick=addLine;
+  async function refresh(){
+    const box=listCard.querySelector("#o-list");
+    try{
+      const rows=await api("/api/sales-orders");
+      box.className=""; box.innerHTML=rows.length?rows.map(o=>{
+        const cancelled=o.order_status==="已取消";
+        const st=cancelled?"已取消":`${o.ship_status} · ${o.pay_status}`;
+        return `<div class="line"><div class="row"><b>${esc(o.order_no)}</b><span class="pill ${cancelled?"gray":""}">${esc(st)}</span></div>
+        <div class="small">${esc(o.customer_name)} · ${esc(o.warehouse_name)} · ${esc(o.biz_date)} · 总计 <b>${money(o.total_cents)}</b>(货款 ${money(o.goods_cents)} + 运费 ${money(o.freight_cents)} ${esc(o.freight_payer)})${o.cost_cents?` · 成本 ${money(o.cost_cents)}`:""}</div>
+        <div class="small">${o.lines.map(l=>`${esc(l.product_name)}×${l.qty}@${money(l.unit_price_cents)}${l.line_type==="赠送"?"(赠送)":""}`).join("、")}</div>
+        <div class="small">物流号:${esc(o.logistics_no||"—")} · 发货时间:${esc((o.ship_time||"—").replace("T"," ").slice(0,16))}</div>
+        ${cancelled?`<div class="small">取消原因:${esc(o.cancel_reason||"—")}</div>`:`<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
+          ${o.ship_status!=="已发货"?`<input id="log-${o.id}" placeholder="物流号" value="${esc(o.logistics_no||"")}" style="flex:1 1 140px"><button class="btn sm" data-ship="${o.id}">发货出库</button>`:""}
+          <button class="btn sm sec" data-payst="${o.id}" data-next="${o.pay_status==="已付款"?"未付款":"已付款"}">${o.pay_status==="已付款"?"改未付款":"改已付款"}</button>
+          <button class="btn sm sec" data-copy="${esc(o.public_path)}">复制客户链接</button>
+          ${o.ship_status!=="已发货"?`<button class="btn sm sec" data-cancel="${o.id}">取消货单</button>`:""}</div>`}</div>`}).join(""):"暂无货单";
+      box.querySelectorAll("[data-ship]").forEach(b=>b.onclick=()=>busy(b,async()=>{
+        const log=box.querySelector(`#log-${b.dataset.ship}`).value;
+        await api(`/api/sales-orders/${b.dataset.ship}/ship`,{method:"POST",body:JSON.stringify({logistics_no:log,ship_time:""})});
+        refresh();}));
+      box.querySelectorAll("[data-payst]").forEach(b=>b.onclick=()=>busy(b,async()=>{
+        await api(`/api/sales-orders/${b.dataset.payst}/pay-status`,{method:"POST",body:JSON.stringify({pay_status:b.dataset.next})});
+        refresh();}));
+      box.querySelectorAll("[data-cancel]").forEach(b=>b.onclick=()=>busy(b,async()=>{
+        const reason=prompt("取消原因(可空,记录保留):","")??"";
+        await api(`/api/sales-orders/${b.dataset.cancel}/cancel`,{method:"POST",body:JSON.stringify({reason})});
+        refresh();}));
+      box.querySelectorAll("[data-copy]").forEach(b=>b.onclick=async()=>{
+        const url=location.origin+b.dataset.copy;
+        try{await navigator.clipboard.writeText(url);b.textContent="已复制"}catch(e){prompt("复制这个链接发给客户:",url)}});
+    }catch(e){box.className="err";box.textContent=e.message}
+  }
+  refresh();
+  card.querySelector("#o-submit").onclick=e=>busy(e.target,async()=>{
+    const err=card.querySelector("#o-err"),ok=card.querySelector("#o-ok");err.textContent="";ok.textContent="";
+    const lines=[...linesBox.children].map(d=>({product_id:+d.querySelector(".ln-p").value,qty:+d.querySelector(".ln-q").value,unit_price:d.querySelector(".ln-u").value||"0",line_type:d.querySelector(".ln-t").value}));
+    try{
+      const r=await api("/api/sales-orders",{method:"POST",body:JSON.stringify({
+        customer_id:+card.querySelector("#o-cust").value,warehouse_id:+card.querySelector("#o-wh").value,
+        biz_date:today(),lines,freight:card.querySelector("#o-freight").value||"0",
+        freight_payer:card.querySelector("#o-payer").value,pay_status:card.querySelector("#o-pay").value,
+        logistics_no:card.querySelector("#o-log").value,note:card.querySelector("#o-note").value,
+        idempotency_key:card.dataset.idem||(card.dataset.idem=crypto.randomUUID())})});
+      ok.textContent=`货单已生成:${r.order_no} 客户链接:${location.origin}${r.public_path}`;
+      delete card.dataset.idem; refresh();
+    }catch(ex){err.textContent=ex.message}
+  });
+}
+
+/* ---------------- 调拨 ---------------- */
+async function vTransfer(v){
+  loading(v); await loadBase();
+  const batches=await api("/api/inventory?view=batch");
+  const card=el("div","card");
+  card.innerHTML=`<b>新建调拨单</b><div class="small">只挪存放仓库,不动钱;按批次调</div>
+    <div class="grid3"><div><label>调出仓</label><select id="t-from">${DATA.warehouses.map(w=>`<option value="${w.id}">${esc(w.name)}</option>`).join("")}</select></div>
+    <div><label>调入仓</label><select id="t-to">${DATA.warehouses.map(w=>`<option value="${w.id}">${esc(w.name)}</option>`).join("")}</select></div>
+    <div><label>日期</label><input id="t-date" type="date" value="${today()}"></div></div>
+    <div class="grid2"><div><label>批次(商品·剩/总数·存放)</label><select id="t-batch">${batches.filter(b=>b.qty_remaining>0).map(b=>`<option value="${b.batch_id}">#${b.batch_id} ${esc(b.product_name)}${b.vintage?" "+esc(b.vintage):""} · 剩${b.qty_remaining} · ${esc(b.locations||"")}</option>`).join("")}</select></div>
+    <div><label>数量</label><input id="t-qty" type="number" min="1" value="1"></div></div>
+    <div style="margin-top:12px"><button class="btn" id="t-submit" style="width:100%">确认调拨</button></div>
+    <div class="ok" id="t-ok"></div><div class="err" id="t-err"></div>`;
+  const listCard=el("div","card",`<b>调拨单</b><div id="t-list" class="loading">加载中…</div>`);
+  v.replaceChildren(card,listCard);
+  async function refresh(){
+    const box=listCard.querySelector("#t-list");
+    try{const rows=await api("/api/transfers"); box.className="";
+      box.innerHTML=rows.length?rows.map(t=>`<div class="line"><div class="row"><b>${esc(t.transfer_no)}</b><span class="small">${esc(t.biz_date)}</span></div>
+      <div class="small">${esc(t.from_name)} → ${esc(t.to_name)} · ${t.lines.map(l=>`${esc(l.product_name)}×${l.qty}(批次#${l.batch_id})`).join("、")}</div></div>`).join(""):"暂无调拨单";
+    }catch(e){box.className="err";box.textContent=e.message}
+  }
+  refresh();
+  card.querySelector("#t-submit").onclick=e=>busy(e.target,async()=>{
+    const err=card.querySelector("#t-err"),ok=card.querySelector("#t-ok");err.textContent="";ok.textContent="";
+    try{const r=await api("/api/transfers",{method:"POST",body:JSON.stringify({
+      from_warehouse_id:+card.querySelector("#t-from").value,to_warehouse_id:+card.querySelector("#t-to").value,
+      biz_date:card.querySelector("#t-date").value,
+      lines:[{batch_id:+card.querySelector("#t-batch").value,qty:+card.querySelector("#t-qty").value}],
+      idempotency_key:crypto.randomUUID()})});
+      ok.textContent=`调拨成功:${r.transfer_no}`; refresh();
+    }catch(ex){err.textContent=ex.message}
+  });
+}
+
+/* ---------------- 应付 ---------------- */
+async function vPay(v){
+  loading(v);
+  const card=el("div","card",`<b>应付供应商</b><div id="pay-body" class="loading">加载中…</div>`);
+  v.replaceChildren(card);
+  const body=card.querySelector("#pay-body");
+  try{
+    const rows=await api("/api/payables");
+    const due=rows.reduce((s,r)=>s+r.balance_cents,0);
+    body.className=""; body.innerHTML=`<div class="small" style="margin:6px 0">未付合计 <b>${money(due)}</b></div>`+(rows.length?rows.map(r=>`<div class="line">
+      <div class="row"><b>${esc(r.supplier_name)}</b><span class="pill ${r.balance_cents?"":"gray"}">${r.balance_cents?"未付 "+money(r.balance_cents):"已付清"}</span></div>
+      <div class="small">${esc(r.order_no)} · ${esc(r.biz_date)} · 应付 ${money(r.amount_cents)} · 已付 ${money(r.paid_cents)}</div>
+      ${r.payments.map(p=>`<div class="small">↳ ${esc(p.pay_date)} 付 ${money(p.amount_cents)} ${esc(p.note)}</div>`).join("")}
+      ${r.balance_cents?`<div class="grid2" style="margin-top:6px"><input id="amt-${r.id}" inputmode="decimal" placeholder="付款金额(元)"><button class="btn sm" data-pay="${r.id}">登记付款</button></div>`:""}</div>`).join(""):"暂无应付(期初库存不产生应付)");
+    body.querySelectorAll("[data-pay]").forEach(b=>b.onclick=()=>busy(b,async()=>{
+      const amt=body.querySelector(`#amt-${b.dataset.pay}`).value;
+      await api(`/api/payables/${b.dataset.pay}/payments`,{method:"POST",body:JSON.stringify({amount:amt,pay_date:today(),note:""})});
+      vPay(v);
+    }));
+  }catch(e){body.className="err";body.textContent=e.message}
+}
+
+/* ---------------- 档案 ---------------- */
+async function vBase(v){
+  loading(v); await loadBase();
+  const wrap=el("div");
+  function section(title,items,formHtml,onAdd,fmt){
+    const c=el("div","card",`<b>${title}</b><div>${items.length?items.map(fmt).join(""):'<div class="small">暂无</div>'}</div><div class="line">${formHtml}<button class="btn sm" style="margin-top:8px">添加</button><div class="err"></div></div>`);
+    c.querySelector("button").onclick=e=>busy(e.target,async()=>{try{await onAdd(c);vBase(v)}catch(ex){c.querySelector(".err").textContent=ex.message}});
+    wrap.appendChild(c);
+  }
+  section("商品(酒/附件)",DATA.products,
+    `<div class="grid2"><div><label>类型</label><select class="f-type"><option>酒</option><option>附件</option></select></div>
+     <div><label>名字</label><input class="f-name" placeholder="如:拉菲 / 礼品袋"></div></div>
+     <div class="grid3"><div><label>种类(酒)</label><input class="f-cat" placeholder="红葡萄酒"></div>
+     <div><label>年份(酒)</label><input class="f-vin" placeholder="2018"></div>
+     <div><label>原产地(酒)</label><input class="f-org" placeholder="法国波尔多"></div></div>`,
+    async c=>api("/api/products",{method:"POST",body:JSON.stringify({type:c.querySelector(".f-type").value,name:c.querySelector(".f-name").value,category:c.querySelector(".f-cat").value,vintage:c.querySelector(".f-vin").value,origin:c.querySelector(".f-org").value})}),
+    p=>`<div class="line"><b>${esc(p.name)}</b> <span class="pill gray">${esc(p.type)}</span><div class="small">${[p.category,p.vintage,p.origin].filter(Boolean).map(esc).join(" · ")}</div></div>`);
+  const partyForm=`<div class="grid2"><div><label>名字</label><input class="f-name"></div><div><label>联系人</label><input class="f-contact"></div></div><div class="grid2"><div><label>电话</label><input class="f-phone"></div><div><label>备注</label><input class="f-note"></div></div>`;
+  const partyBody=c=>({name:c.querySelector(".f-name").value,contact:c.querySelector(".f-contact").value,phone:c.querySelector(".f-phone").value,note:c.querySelector(".f-note").value});
+  const partyFmt=p=>`<div class="line"><b>${esc(p.name)}</b><div class="small">${[p.contact,p.phone,p.note].filter(Boolean).map(esc).join(" · ")}</div></div>`;
+  section("供应商",DATA.suppliers,partyForm,async c=>api("/api/suppliers",{method:"POST",body:JSON.stringify(partyBody(c))}),partyFmt);
+  section("客户",DATA.customers,partyForm,async c=>api("/api/customers",{method:"POST",body:JSON.stringify(partyBody(c))}),partyFmt);
+  section("仓库",DATA.warehouses,`<label>名字</label><input class="f-name" placeholder="如:主仓 / 家里酒柜">`,
+    async c=>api("/api/warehouses",{method:"POST",body:JSON.stringify({name:c.querySelector(".f-name").value})}),
+    w=>`<div class="line"><b>${esc(w.name)}</b></div>`);
+  v.replaceChildren(wrap);
+}
+
+/* ---------------- 设置 ---------------- */
+async function vSet(v){
+  const c=el("div","card",`<b>设置</b>
+    <label>原密码</label><input id="s-old" type="password">
+    <label>新密码(至少6位)</label><input id="s-new" type="password">
+    <div style="margin-top:10px"><button class="btn" id="s-pw">改密码</button>
+    <button class="btn sec" id="s-bk">立即备份</button></div>
+    <label style="margin-top:14px">开放注册(新账号注册后为管理员)</label>
+    <select id="s-reg"><option value="0">关闭</option><option value="1">开放</option></select>
+    <div style="margin-top:8px"><button class="btn sec" id="s-reg-btn">保存注册开关</button></div>
+    <div class="ok" id="s-ok"></div><div class="err" id="s-err"></div>
+    <div class="small" style="margin-top:10px">备份文件保存在服务器 data/backups/ 目录。</div>`);
+  v.replaceChildren(c);
+  c.querySelector("#s-pw").onclick=e=>busy(e.target,async()=>{
+    c.querySelector("#s-err").textContent="";
+    try{await api("/api/change-password",{method:"POST",body:JSON.stringify({old_password:c.querySelector("#s-old").value,new_password:c.querySelector("#s-new").value})});
+      c.querySelector("#s-ok").textContent="密码已修改";}catch(ex){c.querySelector("#s-err").textContent=ex.message}});
+  c.querySelector("#s-bk").onclick=e=>busy(e.target,async()=>{
+    c.querySelector("#s-err").textContent="";
+    try{const r=await api("/api/backup",{method:"POST",body:"{}"});
+      c.querySelector("#s-ok").textContent="备份完成:"+r.file;}catch(ex){c.querySelector("#s-err").textContent=ex.message}});
+  try{const me=await api("/api/me");c.querySelector("#s-reg").value=me.registration_open?"1":"0"}catch(e){}
+  c.querySelector("#s-reg-btn").onclick=e=>busy(e.target,async()=>{
+    c.querySelector("#s-err").textContent="";
+    try{await api("/api/settings/registration",{method:"POST",body:JSON.stringify({open:c.querySelector("#s-reg").value==="1"})});
+      c.querySelector("#s-ok").textContent="注册开关已保存";}catch(ex){c.querySelector("#s-err").textContent=ex.message}});
+}
+
+/* ---------------- 启动 ---------------- */
+const VIEWS={stock:vStock,in:vIn,orders:vOrders,transfer:vTransfer,pay:vPay,base:vBase,set:vSet};
+let cur="stock";
+function go(t){cur=t;document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.t===t));VIEWS[t]($("#view"))}
+document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>go(b.dataset.t));
+$("#logout").onclick=async e=>{e.preventDefault();await api("/api/logout",{method:"POST",body:"{}"});location.reload()};
+$("#li-btn").onclick=e=>busy(e.target,async()=>{
+  $("#li-err").textContent="";
+  try{await api("/api/login",{method:"POST",body:JSON.stringify({username:$("#li-user").value,password:$("#li-pass").value})});boot()}
+  catch(ex){$("#li-err").textContent=ex.message}});
+$("#li-pass").addEventListener("keydown",e=>{if(e.key==="Enter")$("#li-btn").click()});
+$("#li-reg-btn").onclick=e=>busy(e.target,async()=>{
+  $("#li-err").textContent="";
+  try{await api("/api/register",{method:"POST",body:JSON.stringify({username:$("#li-user").value,password:$("#li-pass").value})});
+    await api("/api/login",{method:"POST",body:JSON.stringify({username:$("#li-user").value,password:$("#li-pass").value})});boot()}
+  catch(ex){$("#li-err").textContent=ex.message}});
+async function boot(){
+  const me=await api("/api/me");
+  $("#ver").textContent=me.version||"";
+  if(!me.logged_in){
+    $("#login").style.display="flex";$("#main").style.display="none";
+    try{const rs=await api("/api/registration-status");
+      $("#li-reg").style.display=rs.open?"block":"none";
+      $("#li-sub").textContent=rs.has_users?"请登录":"首次使用:请注册管理员账号";
+    }catch(e){}
+    return}
+  $("#login").style.display="none";$("#main").style.display="block";
+  $("#uname").textContent=me.username;
+  go("stock");
+}
+boot();
+</script>
+</body>
+</html>
