@@ -98,7 +98,7 @@ def main():
         s, d = c.call("POST", "/api/login", {"username": "allen314", "password": "test-pass-123"})
         check("管理员登录", s == 200, str(d))
         _, me = c.call("GET", "/api/me")
-        check("版本号 v0.3.0", me.get("version") == "v0.3.0", str(me))
+        check("版本号 v0.4.0", me.get("version") == "v0.4.0", str(me))
 
         _, s1 = c.call("POST", "/api/suppliers", {"name": "供应商甲"})
         _, s2 = c.call("POST", "/api/suppliers", {"name": "供应商乙"})

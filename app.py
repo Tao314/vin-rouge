@@ -29,7 +29,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("WINE_DATA_DIR", BASE_DIR / "data"))
 DB_PATH = Path(os.environ.get("WINE_DB_PATH", DATA_DIR / "wine.db"))
 STATIC_DIR = BASE_DIR / "static"
-APP_VERSION = "v0.3.0"
+APP_VERSION = "v0.4.0"
 SESSION_DAYS = 30
 ADMIN_USER = os.environ.get("WINE_ADMIN_USER", "allen314")
 # 不写死密码: 优先环境变量 WINE_ADMIN_PASSWORD; 未设时首次启动随机生成,

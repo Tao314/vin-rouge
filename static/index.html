@@ -16,6 +16,9 @@ h1{font-size:19px;margin:0;white-space:nowrap}
 nav{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
 nav button{flex:1 1 auto;min-width:56px;padding:8px 4px;border:1px solid #d8d8dc;background:#fff;border-radius:9px;font-size:14px;cursor:pointer}
 nav button.on{background:#7a1f2b;color:#fff;border-color:#7a1f2b;font-weight:600}
+.subnav{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px}
+.subnav button{flex:1 1 auto;min-width:52px;padding:7px 4px;border:1px solid #d8d8dc;background:#fff;border-radius:9px;font-size:13px;cursor:pointer}
+.subnav button.on{background:#7a1f2b;color:#fff;border-color:#7a1f2b;font-weight:600}
 .card{background:#fff;border:1px solid #e4e4e8;border-radius:12px;padding:12px;margin:10px 0}
 .row{display:flex;justify-content:space-between;align-items:center;gap:8px}
 .small{font-size:12px;color:#777}
@@ -451,11 +454,17 @@ async function vPay(v){
 }
 
 /* ---------------- 档案 ---------------- */
+let BASE_SUB="wine";
 async function vBase(v){
   loading(v); await loadBase();
   const wrap=el("div");
-  function section(title,items,formHtml,readBody,url,fmt,fill){
-    const c=el("div","card",`<b>${title}</b><div>${items.length?items.map(fmt).join(""):'<div class="small">暂无</div>'}</div><div class="line">${formHtml}<button class="btn sm" style="margin-top:8px">添加</button><div class="err"></div></div>`);
+  const subs=[["wine","红酒"],["acc","附件"],["sup","供应商"],["cust","客户"],["wh","仓库"]];
+  const subnav=el("nav","subnav",subs.map(([k,t])=>`<button data-s="${k}" class="${BASE_SUB===k?"on":""}">${t}</button>`).join(""));
+  subnav.querySelectorAll("button").forEach(b=>b.onclick=()=>{BASE_SUB=b.dataset.s;vBase(v)});
+  wrap.appendChild(subnav);
+  function section(title,items,formHtml,readBody,url,fmt,fill,searchable){
+    const c=el("div","card",`<b>${title}</b>${searchable?'<input class="f-search" placeholder="搜索名字…" style="margin-top:8px">':""}<div>${items.length?items.map(fmt).join(""):'<div class="small">暂无</div>'}</div><div class="line">${formHtml}<button class="btn sm" style="margin-top:8px">添加</button><div class="err"></div></div>`);
+    if(searchable){const s=c.querySelector(".f-search");s.oninput=()=>{const q=s.value.trim();c.querySelectorAll("[data-edit]").forEach(b=>{const ln=b.closest(".line");ln.style.display=(!q||ln.textContent.includes(q))?"":"none"})}}
     c.querySelector(":scope > .line > button").onclick=e=>busy(e.target,async()=>{try{await api(url,{method:"POST",body:JSON.stringify(readBody(c))});vBase(v)}catch(ex){c.querySelector(".err").textContent=ex.message}});
     c.querySelectorAll("[data-edit]").forEach(b=>b.onclick=()=>{
       const item=items.find(x=>x.id==b.dataset.edit); const div=c.querySelector(`#edit-${url.split("/").pop()}-${item.id}`);
@@ -468,28 +477,32 @@ async function vBase(v){
     });
     wrap.appendChild(c);
   }
-  const prodForm=`<div class="grid2"><div><label>类型</label><select class="f-type"><option>酒</option><option>附件</option></select></div>
-     <div><label>名字</label><input class="f-name" placeholder="如:拉菲 / 礼品袋"></div></div>
-     <div class="grid3"><div><label>种类(酒)</label><input class="f-cat" placeholder="红葡萄酒"></div>
-     <div><label>年份(酒)</label><input class="f-vin" placeholder="2018"></div>
-     <div><label>原产地(酒)</label><input class="f-org" placeholder="法国波尔多"></div></div>
+  const wineForm=`<label>名字</label><input class="f-name" placeholder="如:拉菲">
+     <div class="grid3"><div><label>种类</label><input class="f-cat" placeholder="红葡萄酒"></div>
+     <div><label>年份</label><input class="f-vin" placeholder="2018"></div>
+     <div><label>原产地</label><input class="f-org" placeholder="法国波尔多"></div></div>
      <label>备注</label><input class="f-note">`;
-  const prodBody=c=>({type:c.querySelector(".f-type").value,name:c.querySelector(".f-name").value,category:c.querySelector(".f-cat").value,vintage:c.querySelector(".f-vin").value,origin:c.querySelector(".f-org").value,note:c.querySelector(".f-note").value});
-  section("商品(酒/附件)",DATA.products,prodForm,prodBody,"/api/products",
-    p=>`<div class="line"><b>${esc(p.name)}</b> <span class="pill gray">${esc(p.type)}</span> <button class="btn sm sec" data-edit="${p.id}">修改</button><div class="small">${[p.category,p.vintage,p.origin,p.note].filter(Boolean).map(esc).join(" · ")}</div><div id="edit-products-${p.id}" style="display:none"></div></div>`,
-    (c,p)=>{c.querySelector(".f-type").value=p.type;c.querySelector(".f-name").value=p.name;c.querySelector(".f-cat").value=p.category||"";c.querySelector(".f-vin").value=p.vintage||"";c.querySelector(".f-org").value=p.origin||"";c.querySelector(".f-note").value=p.note||""});
+  const wineBody=c=>({type:"酒",name:c.querySelector(".f-name").value,category:c.querySelector(".f-cat").value,vintage:c.querySelector(".f-vin").value,origin:c.querySelector(".f-org").value,note:c.querySelector(".f-note").value});
+  const wineFill=(c,p)=>{c.querySelector(".f-name").value=p.name;c.querySelector(".f-cat").value=p.category||"";c.querySelector(".f-vin").value=p.vintage||"";c.querySelector(".f-org").value=p.origin||"";c.querySelector(".f-note").value=p.note||""};
+  const wineFmt=p=>`<div class="line"><b>${esc(p.name)}</b> <button class="btn sm sec" data-edit="${p.id}">修改</button><div class="small">${[p.category,p.vintage,p.origin,p.note].filter(Boolean).map(esc).join(" · ")}</div><div id="edit-products-${p.id}" style="display:none"></div></div>`;
+  const accForm=`<label>名字</label><input class="f-name" placeholder="如:礼品袋 / 开瓶器"><label>备注</label><input class="f-note">`;
+  const accBody=c=>({type:"附件",name:c.querySelector(".f-name").value,category:"",vintage:"",origin:"",note:c.querySelector(".f-note").value});
+  const accFill=(c,p)=>{c.querySelector(".f-name").value=p.name;c.querySelector(".f-note").value=p.note||""};
+  const accFmt=p=>`<div class="line"><b>${esc(p.name)}</b> <button class="btn sm sec" data-edit="${p.id}">修改</button>${p.note?`<div class="small">${esc(p.note)}</div>`:""}<div id="edit-products-${p.id}" style="display:none"></div></div>`;
+  if(BASE_SUB==="wine")section("红酒清单",DATA.products.filter(p=>p.type==="酒"),wineForm,wineBody,"/api/products",wineFmt,wineFill,true);
+  else if(BASE_SUB==="acc")section("附件清单",DATA.products.filter(p=>p.type==="附件"),accForm,accBody,"/api/products",accFmt,accFill,true);
   const partyForm=`<div class="grid2"><div><label>姓名</label><input class="f-name"></div><div><label>电话</label><input class="f-phone"></div></div><label>备注</label><input class="f-note">`;
   const partyBody=c=>({name:c.querySelector(".f-name").value,phone:c.querySelector(".f-phone").value,note:c.querySelector(".f-note").value});
   const partyFill=(c,p)=>{c.querySelector(".f-name").value=p.name;c.querySelector(".f-phone").value=p.phone||"";c.querySelector(".f-note").value=p.note||""};
   const partyFmt=(kind)=>p=>`<div class="line"><b>${esc(p.name)}</b> <button class="btn sm sec" data-edit="${p.id}">修改</button><div class="small">${[p.phone,p.note].filter(Boolean).map(esc).join(" · ")}</div><div id="edit-${kind}-${p.id}" style="display:none"></div></div>`;
-  section("供应商",DATA.suppliers,partyForm,partyBody,"/api/suppliers",partyFmt("suppliers"),partyFill);
+  if(BASE_SUB==="sup")section("供应商",DATA.suppliers,partyForm,partyBody,"/api/suppliers",partyFmt("suppliers"),partyFill);
   const custForm=`<div class="grid2"><div><label>姓名</label><input class="f-name"></div><div><label>电话</label><input class="f-phone"></div></div><label>地址</label><input class="f-address"><label>备注</label><input class="f-note">`;
   const custBody=c=>({name:c.querySelector(".f-name").value,phone:c.querySelector(".f-phone").value,address:c.querySelector(".f-address").value,note:c.querySelector(".f-note").value});
   const custFill=(c,p)=>{c.querySelector(".f-name").value=p.name;c.querySelector(".f-phone").value=p.phone||"";c.querySelector(".f-address").value=p.address||"";c.querySelector(".f-note").value=p.note||""};
   const custFmt=p=>`<div class="line"><b>${esc(p.name)}</b> <button class="btn sm sec" data-edit="${p.id}">修改</button><div class="small">${[p.phone,p.address,p.note].filter(Boolean).map(esc).join(" · ")}</div><div id="edit-customers-${p.id}" style="display:none"></div></div>`;
-  section("客户",DATA.customers,custForm,custBody,"/api/customers",custFmt,custFill);
+  if(BASE_SUB==="cust")section("客户",DATA.customers,custForm,custBody,"/api/customers",custFmt,custFill);
   const whForm=`<label>名字</label><input class="f-name" placeholder="如:主仓 / 家里酒柜"><label>备注</label><input class="f-note">`;
-  section("仓库",DATA.warehouses,whForm,c=>({name:c.querySelector(".f-name").value,note:c.querySelector(".f-note").value}),"/api/warehouses",
+  if(BASE_SUB==="wh")section("仓库",DATA.warehouses,whForm,c=>({name:c.querySelector(".f-name").value,note:c.querySelector(".f-note").value}),"/api/warehouses",
     w=>`<div class="line"><b>${esc(w.name)}</b> <button class="btn sm sec" data-edit="${w.id}">修改</button>${w.note?`<div class="small">${esc(w.note)}</div>`:""}<div id="edit-warehouses-${w.id}" style="display:none"></div></div>`,
     (c,w)=>{c.querySelector(".f-name").value=w.name;c.querySelector(".f-note").value=w.note||""});
   v.replaceChildren(wrap);

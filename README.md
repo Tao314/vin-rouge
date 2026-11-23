@@ -1,6 +1,6 @@
 # 红酒进销存系统
 
-红酒购买 / 存储 / 销售管理。当前 v0.3.0:采购入库、批次库存、多仓调拨、应付付款、客户货单(预定/发货/公开单页)、注册与管理员、已录入信息可更改。
+红酒购买 / 存储 / 销售管理。当前 v0.4.0:采购入库、批次库存、多仓调拨、应付付款、客户货单(预定/发货/公开单页)、注册与管理员、已录入信息可更改、档案分页(红酒/附件/供应商/客户/仓库各自独立页面)。
 
 ## 功能特色
 
@@ -42,26 +42,52 @@ WINE_ADMIN_PASSWORD='自己设一个强密码' ./venv/bin/uvicorn app:app --host
 - 备份:页面「设置 → 立即备份」,或命令行 `./backup.sh`(SQLite Online Backup,保留最近 10 份)
 - 恢复:停服务,把备份文件拷回 `data/wine.db` 后重启
 
-## 部署(s-sj2 / Debian 13,root 模式)
+## 安装(VPS,Debian 13,root 模式)
 
 ```bash
-git clone https://github.com/Tao314/vin-rouge.git
-cd vin-rouge
+git clone https://github.com/Tao314/vin-rouge.git /opt/vin-rouge
+cd /opt/vin-rouge
 bash install.sh
+curl -s http://127.0.0.1:9000/api/me   # 应返回 {"detail":"未登录"}
 ```
 
-装为 systemd 服务 `wine-system`(以 root 运行),监听 `127.0.0.1:9000`,前面放 Nginx/Caddy 反代 HTTPS(域名解析与反代自行配置)。装完验证:`systemctl status wine-system`、`curl -s http://127.0.0.1:9000/api/me`。更新:`git pull` 后 `systemctl restart wine-system`(纯前端改动只需 pull)。
+install.sh 会做:装 python3/venv、建虚拟环境装依赖、写 systemd 服务 `wine-system`(以 root 运行,监听 127.0.0.1:9000)并启动。脚本可重复执行(幂等)。
+
+服务只监听 127.0.0.1:9000。对外访问请在前面加 Nginx 或 Caddy 反代并配 HTTPS(域名解析与反代自行配置),例如 Caddyfile:
+
+```
+your.domain {
+    reverse_proxy 127.0.0.1:9000
+}
+```
+
+更新到新版:
+
+```bash
+cd /opt/vin-rouge
+git pull
+systemctl restart wine-system
+```
+
+纯前端改动只需 `git pull`。老数据库启动时自动迁移,数据不动。
+
+常用运维命令:
+
+```bash
+systemctl status wine-system        # 看状态
+journalctl -u wine-system -n 30 -l  # 看日志
+```
 
 ## 卸载
 
 ```bash
 systemctl disable --now wine-system
-rm /etc/systemd/system/wine-system.service
+rm -f /etc/systemd/system/wine-system.service
 systemctl daemon-reload
-rm -rf vin-rouge
+rm -rf /opt/vin-rouge
 ```
 
-说明:`vin-rouge` 为 clone 目录(按实际路径替换);删除前请先备份 `data/wine.db` 与 `data/backups/`。`install.sh` 装的 python3 等系统包不用删,不影响其他服务。
+删完即干净(删除前请先备份 `data/wine.db` 与 `data/backups/`)。install.sh 装的 python3、python3-venv 等系统包可保留,不影响其他服务;反代(Nginx/Caddy)里的站点配置需自行删除。
 
 ## 目录结构
 
@@ -101,3 +127,4 @@ python3 tests/test_v4.py
 - v0.1.1:服务端口改为 9000(监听 127.0.0.1:9000,域名解析与反代自行配置)
 - v0.2.0:客户货单(预定/发货扣库存/取消留痕/公开单页/付款状态)、入库付款状态、注册与管理员(首个注册者自动管理员+注册开关)、老库自动迁移兼容
 - v0.3.0:已录入信息可更改——档案/货单/入库单/调拨/付款记录均可改(带库存/应付逻辑把关),修改留痕与修改记录查看,老库自动迁移兼容;客户信息字段为姓名/电话/地址/备注,供应商信息字段为姓名/电话/备注(公开单页显示客户电话与地址)
+- v0.4.0:档案分页——红酒清单/附件清单/供应商/客户/仓库各自独立页面(档案页内子页签切换),红酒与附件清单可搜索;入库/货单从清单选择;部署目录统一为 /opt/vin-rouge
