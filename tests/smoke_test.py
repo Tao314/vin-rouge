@@ -74,11 +74,11 @@ def main():
         s, _ = req("GET", "/api/wines")
         check("未登录调业务接口返回 401", s == 401, f"status={s}")
 
-        # 1b. 版本接口公开返回 v2.5.2（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
+        # 1b. 版本接口公开返回 v2.9.0（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
         s, d = req("GET", "/api/version")
-        check("版本接口 /api/version 返回 v2.8.0", s == 200 and d.get("version") == "v2.8.0", f"status={s} {d}")
+        check("版本接口 /api/version 返回 v2.9.0", s == 200 and d.get("version") == "v2.9.0", f"status={s} {d}")
         s, d = req("GET", "/api/config")
-        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.8.0" and "build_date" in d, f"status={s} {d}")
+        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.9.0" and "build_date" in d, f"status={s} {d}")
 
         # 2. 无默认用户: 首位注册前注册开放, 默认账号登录失败
         s, d = req("GET", "/api/auth/status")
@@ -764,11 +764,12 @@ def main():
               'background:#fff' in ghost_rule and 'color:#7b1e26' in ghost_rule
               and 'border:1px solid #7b1e26' in ghost_rule
               and '#F2F3F5' not in css, f"ghost={ghost_rule}")
-        check("按钮组都用等宽网格: 管理页 g4 / 单据筛选 g3 / 付款快捷 g3 / 补登原因 g2",
+        check("按钮组都用等宽网格: 管理页 g4 / 单据切换 g2 + 类型筛选 g4x2 / 付款快捷 g3 / 补登原因 g2",
               html.count('class="btn-grid g4"') == 1
+              and html.count('btn-grid g4 hidden') == 2
               and html.count('class="btn-grid g5"') == 0
-              and html.count('class="btn-grid g3"') == 3
-              and html.count('class="btn-grid g2"') == 1, f"status={s}")
+              and html.count('class="btn-grid g3"') == 2
+              and html.count('class="btn-grid g2"') == 2, f"status={s}")
         btn_classes = sorted(set(_re.findall(r'<button[^>]*class="([^"]*)"', html)))
         check("全站按钮 class 只有统一的几种, 无孤立样式",
               set(btn_classes) <= {"ghost", "ghost hidden", "hidden", "btn-block",
@@ -1305,6 +1306,222 @@ def main():
               'class="disc-price"' in html and "折后价 ¥" in html
               and 'outLineDprice(' not in html and 'outLineReason(' not in html
               and '折扣原因' not in html, f"status={s}")
+
+        # 26. v2.9.0: 单据页分未结单 / 已结单
+        # 前端 ordSettled/ordTypeOf 的同规则镜像 (见 static/index.html):
+        # 未结单 = 还有货没确认完; 已结单 = 已全部确认/已作废/已关闭;
+        # 立即生效的单 (补登/自饮/赠送/破损) 下单即已结.
+        def _totals(o):
+            q = sum(i["qty"] for i in o.get("items") or [])
+            cq = sum(i.get("confirmed_qty") or 0 for i in o.get("items") or [])
+            return q, cq
+
+        def _settled(kind, o):
+            if o.get("voided"):
+                return True
+            if kind == "transfers":
+                return o.get("status") == "done"
+            if o.get("status") == "closed":
+                return True
+            if kind == "inbound" and o.get("type") == "opening":
+                return True
+            if kind == "outbound" and o.get("type") != "sale":
+                return True
+            q, cq = _totals(o)
+            return q > 0 and cq >= q
+
+        def _otype(kind, o):
+            if kind == "transfers":
+                return "transfer"
+            if kind == "inbound":
+                return "opening" if o.get("type") == "opening" else "purchase"
+            return "outbound"
+
+        def _all_lists():
+            _, ib = req("GET", "/api/inbound", token=tok)
+            _, ob = req("GET", "/api/outbound", token=tok)
+            _, tr = req("GET", "/api/transfers", token=tok)
+            return {"inbound": ib, "outbound": ob, "transfers": tr}
+
+        def _in_view(oid, kind, view, otype=""):
+            for k, lst in _all_lists().items():
+                for o in lst:
+                    if o["id"] == oid and k == kind:
+                        if ("closed" == view) != _settled(k, o):
+                            return False
+                        if view == "closed" and otype and _otype(k, o) != otype:
+                            return False
+                        return True
+            return False
+
+        # 26a. 新酒 + 补登 20 瓶作底; 补登单直接进已结单/补货单
+        s, w = req("POST", "/api/wines",
+                   {"barcode": "6901234567897", "name": "单据页测试酒",
+                    "capacity_ml": 750, "sale_price": 200}, token=tok)
+        wid_o = w.get("id")
+        check("建单据页测试酒", s == 200 and wid_o, f"status={s} {w}")
+        s, d = req("POST", "/api/inbound",
+                   {"type": "opening", "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_o, "qty": 20, "unit_price": 100}]},
+                   token=tok)
+        op26 = d.get("id")
+        check("补登单直接进已结单/补货单",
+              s == 200 and _in_view(op26, "inbound", "closed", "opening")
+              and not _in_view(op26, "inbound", "open"), f"status={s} {d}")
+
+        # 26b. 进货单: 未确认在未结单, 全部确认后进已结单/进货单
+        s, d = req("POST", "/api/inbound",
+                   {"type": "purchase", "supplier_id": sup, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_o, "qty": 2, "unit_price": 120}]},
+                   token=tok)
+        in26 = d.get("id")
+        check("未确认进货单在未结单、不在已结单",
+              s == 200 and _in_view(in26, "inbound", "open")
+              and not _in_view(in26, "inbound", "closed"), f"status={s} {d}")
+        s, d = req("POST", f"/api/inbound/{in26}/confirm", {}, token=tok)
+        check("进货单确认成功", s == 200, f"status={s} {d}")
+        check("全部确认后只在已结单/进货单",
+              _in_view(in26, "inbound", "closed", "purchase")
+              and not _in_view(in26, "inbound", "open")
+              and not _in_view(in26, "inbound", "closed", "opening"),
+              f"status={s} {d}")
+
+        # 26c. 进货单部分确认后废剩余 -> 已关闭, 进已结单
+        s, d = req("POST", "/api/inbound",
+                   {"type": "purchase", "supplier_id": sup, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_o, "qty": 2, "unit_price": 120}]},
+                   token=tok)
+        in26b = d.get("id")
+        s, d = req("GET", f"/api/inbound/{in26b}", token=tok)
+        item26b = d["items"][0]["id"]
+        s, d = req("POST", f"/api/inbound/{in26b}/confirm",
+                   {"items": [{"item_id": item26b, "qty": 1}]}, token=tok)
+        check("部分确认后仍在未结单",
+              s == 200 and _in_view(in26b, "inbound", "open")
+              and not _in_view(in26b, "inbound", "closed"), f"status={s} {d}")
+        s, db1 = req("GET", "/api/dashboard", token=tok)
+        sup_d1 = db1.get("supplier_debt")
+        s, d = req("POST", f"/api/orders/inbound/{in26b}/void", {}, token=tok)
+        check("部分确认后废剩余成功变已关闭",
+              s == 200 and d.get("status") == "closed", f"status={s} {d}")
+        check("废剩余后进已结单/进货单",
+              _in_view(in26b, "inbound", "closed", "purchase")
+              and not _in_view(in26b, "inbound", "open"), f"status={s} {d}")
+        s, db2 = req("GET", "/api/dashboard", token=tok)
+        check("关闭后已确认部分的欠款保留 (废剩余前后供应商欠款不变)",
+              db2.get("supplier_debt") == sup_d1,
+              f"d1={sup_d1} d2={db2.get('supplier_debt')}")
+        s, d = req("POST", f"/api/inbound/{in26b}/confirm", {}, token=tok)
+        check("已关闭的单再确认被拒 400", s == 400, f"status={s} {d}")
+
+        # 26d. 未确认进货单整单废 -> 已结单
+        s, d = req("POST", "/api/inbound",
+                   {"type": "purchase", "supplier_id": sup, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_o, "qty": 1, "unit_price": 120}]},
+                   token=tok)
+        in26c = d.get("id")
+        s, d = req("POST", f"/api/orders/inbound/{in26c}/void", {}, token=tok)
+        check("未确认废单成功",
+              s == 200 and d.get("status") == "voided", f"status={s} {d}")
+        check("未确认废单后进已结单",
+              _in_view(in26c, "inbound", "closed", "purchase")
+              and not _in_view(in26c, "inbound", "open"), f"status={s} {d}")
+
+        # 26e. 出货单: 未确认在未结单, 确认后进已结单/出货单
+        s, d = req("POST", "/api/outbound",
+                   {"customer_id": cus, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_o, "qty": 1, "unit_price": 200}]},
+                   token=tok)
+        out26 = d.get("id")
+        check("未确认出货单在未结单、不在已结单",
+              s == 200 and _in_view(out26, "outbound", "open")
+              and not _in_view(out26, "outbound", "closed"), f"status={s} {d}")
+        s, d = req("POST", f"/api/outbound/{out26}/confirm", {}, token=tok)
+        check("出货单确认成功", s == 200, f"status={s} {d}")
+        check("确认出货后只在已结单/出货单",
+              _in_view(out26, "outbound", "closed", "outbound")
+              and not _in_view(out26, "outbound", "open"), f"status={s} {d}")
+
+        # 26f. 自饮单下单即生效, 直接进已结单/出货单
+        s, d = req("POST", "/api/outbound",
+                   {"type": "personal", "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_o, "qty": 1}]}, token=tok)
+        per26 = d.get("id")
+        check("自饮单直接进已结单/出货单",
+              s == 200 and _in_view(per26, "outbound", "closed", "outbound")
+              and not _in_view(per26, "outbound", "open"), f"status={s} {d}")
+
+        # 26g. 调拨单: 未确认在未结单, 确认后进已结单/调仓单
+        s, d = req("POST", "/api/transfers",
+                   {"wine_id": wid_o, "from_warehouse_id": wh1,
+                    "to_warehouse_id": wh2, "qty": 1}, token=tok)
+        s, ds = req("GET", "/api/transfers", token=tok)
+        tr26 = [x for x in ds if x["transfer_no"] == d.get("transfer_no")][0]["id"]
+        check("未确认调拨单在未结单、不在已结单",
+              s == 200 and _in_view(tr26, "transfers", "open")
+              and not _in_view(tr26, "transfers", "closed"), f"status={s} {d}")
+        s, d = req("POST", f"/api/transfers/{tr26}/confirm", {}, token=tok)
+        check("调拨单确认成功", s == 200, f"status={s} {d}")
+        check("确认调拨后只在已结单/调仓单",
+              _in_view(tr26, "transfers", "closed", "transfer")
+              and not _in_view(tr26, "transfers", "open"), f"status={s} {d}")
+
+        # 26i. 出货单部分确认后废剩余: 欠款保留, 再确认被拒
+        s, d = req("POST", "/api/outbound",
+                   {"customer_id": cus, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_o, "qty": 2, "unit_price": 200}]},
+                   token=tok)
+        out26b = d.get("id")
+        s, d = req("GET", f"/api/outbound/{out26b}", token=tok)
+        item26o = d["items"][0]["id"]
+        s, d = req("POST", f"/api/outbound/{out26b}/confirm",
+                   {"items": [{"item_id": item26o, "qty": 1}]}, token=tok)
+        check("出货单部分确认成功",
+              s == 200 and d.get("status") == "partial", f"status={s} {d}")
+        s, db1 = req("GET", "/api/dashboard", token=tok)
+        cus_d1 = db1.get("customer_debt")
+        s, d = req("POST", f"/api/orders/outbound/{out26b}/void", {}, token=tok)
+        check("出货单部分确认后废剩余成功变已关闭",
+              s == 200 and d.get("status") == "closed", f"status={s} {d}")
+        s, db2 = req("GET", "/api/dashboard", token=tok)
+        check("关闭后已确认部分的客户欠款保留",
+              db2.get("customer_debt") == cus_d1,
+              f"d1={cus_d1} d2={db2.get('customer_debt')}")
+        s, d = req("POST", f"/api/outbound/{out26b}/confirm", {}, token=tok)
+        check("已关闭的出货单再确认被拒 400", s == 400, f"status={s} {d}")
+        check("废剩余后出货单进已结单/出货单",
+              _in_view(out26b, "outbound", "closed", "outbound")
+              and not _in_view(out26b, "outbound", "open"), f"status={s} {d}")
+
+        # 26h. 前端: 未结单/已结单切换 + 四个类型按钮, 旧三个按钮已删
+        s, html = req("GET", "/")
+        check("单据页有未结单/已结单切换按钮",
+              'id="ord-tab-open"' in html and 'id="ord-tab-closed"' in html
+              and "未结单" in html and "已结单" in html, f"status={s}")
+        check("已结单下有进货单/补货单/出货单/调仓单四个类型按钮",
+              'id="ord-type-purchase"' in html and 'id="ord-type-opening"' in html
+              and 'id="ord-type-outbound"' in html and 'id="ord-type-transfer"' in html
+              and "补货单" in html and "调仓单" in html, f"status={s}")
+        check("旧三个筛选按钮已删",
+              "进货/补登单" not in html and "loadOrders('inbound')" not in html
+              and "loadOrders('outbound')" not in html
+              and "loadOrders('transfers')" not in html, f"status={s}")
+        check("分类逻辑在场 (ordSettled/ordTypeOf/setOrdView/setOrdType)",
+              "ordSettled" in html and "ordTypeOf" in html
+              and "setOrdView" in html and "setOrdType" in html, f"status={s}")
+        check("未结单也有类型筛选 (全部/进货/出货/调仓, 无补货)",
+              'id="ord-type-row-open"' in html and 'id="ord-open-all"' in html
+              and 'id="ord-open-purchase"' in html
+              and 'id="ord-open-outbound"' in html
+              and 'id="ord-open-transfer"' in html
+              and 'id="ord-open-opening"' not in html, f"status={s}")
+        check("未结单为空显示当前没有待处理单据",
+              "当前没有待处理单据" in html, f"status={s}")
+        check("已作废/已关闭/已完成徽标三色区分 (红 bad/黄 warn/绿)",
+              ".badge.bad" in html and "badge${badgeCls}" in html
+              and "badge bad" in html, f"status={s}")
+        check("出货单卡片显示业务类型 (销售/自饮/赠送/破损)",
+              "o.type==='sale'?'销售'" in html, f"status={s}")
 
         # 14. audit_logs 有记录
         s, logs = req("GET", "/api/audit-logs", token=tok)
