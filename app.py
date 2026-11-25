@@ -26,7 +26,7 @@ TOKEN_TTL_HOURS = 24
 # ---------- 版本（单点管理） ----------
 # 唯一版本源：只改 APP_VERSION，全仓同步
 # （前端页脚、README、/api/version、/api/config 都以它为准，不要在别处手写版本号）。
-APP_VERSION = "v2.2.0"
+APP_VERSION = "v2.4.0"
 BUILD_DATE = "2026-11-25"
 
 
@@ -54,7 +54,7 @@ def init_db():
         c.executescript("""
         CREATE TABLE IF NOT EXISTS users(
           id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
-          display_name TEXT, password_hash TEXT NOT NULL, active INTEGER DEFAULT 1,
+          password_hash TEXT NOT NULL, active INTEGER DEFAULT 1,
           must_change_password INTEGER DEFAULT 0, session_token TEXT,
           session_expires_at TEXT, created_at TEXT);
         CREATE TABLE IF NOT EXISTS audit_logs(
@@ -82,10 +82,13 @@ def init_db():
           type TEXT NOT NULL, supplier_id INTEGER, warehouse_id INTEGER,
           order_date TEXT, carrier TEXT, tracking_no TEXT, freight REAL DEFAULT 0,
           freight_free INTEGER DEFAULT 0, freight_payer TEXT, goods_total REAL DEFAULT 0,
-          pay_status TEXT DEFAULT 'unpaid', note TEXT, created_at TEXT);
+          pay_status TEXT DEFAULT 'unpaid', note TEXT, created_at TEXT,
+          status TEXT DEFAULT 'pending',
+          voided INTEGER DEFAULT 0, voided_at TEXT);
         CREATE TABLE IF NOT EXISTS inbound_items(
           id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER, wine_id INTEGER,
-          batch TEXT DEFAULT '', qty INTEGER, unit_price REAL);
+          batch TEXT DEFAULT '', qty INTEGER, unit_price REAL,
+          confirmed_qty INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS outbound_orders(
           id INTEGER PRIMARY KEY AUTOINCREMENT, order_no TEXT UNIQUE NOT NULL,
           customer_id INTEGER, warehouse_id INTEGER, order_date TEXT,
@@ -93,22 +96,40 @@ def init_db():
           freight_free INTEGER DEFAULT 0, freight_payer TEXT, sale_total REAL DEFAULT 0,
           type TEXT DEFAULT 'sale', cost_total REAL DEFAULT 0,
           orig_total REAL DEFAULT 0, discount_total REAL DEFAULT 0,
-          pay_status TEXT DEFAULT 'unpaid', note TEXT, created_at TEXT);
+          pay_status TEXT DEFAULT 'unpaid', note TEXT, created_at TEXT,
+          status TEXT DEFAULT 'pending',
+          voided INTEGER DEFAULT 0, voided_at TEXT);
         CREATE TABLE IF NOT EXISTS outbound_items(
           id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER, wine_id INTEGER,
           batch TEXT DEFAULT '', qty INTEGER, unit_price REAL, orig_price REAL,
           discount_rate REAL, discount_amount REAL DEFAULT 0,
-          cost_price REAL DEFAULT 0, reason TEXT);
+          cost_price REAL DEFAULT 0, reason TEXT,
+          confirmed_qty INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS transfers(
           id INTEGER PRIMARY KEY AUTOINCREMENT, transfer_no TEXT UNIQUE NOT NULL,
           from_warehouse_id INTEGER, to_warehouse_id INTEGER, wine_id INTEGER,
-          batch TEXT DEFAULT '', qty INTEGER, created_at TEXT, note TEXT);
+          batch TEXT DEFAULT '', qty INTEGER, created_at TEXT, note TEXT,
+          status TEXT DEFAULT 'pending',
+          voided INTEGER DEFAULT 0, voided_at TEXT);
+        CREATE TABLE IF NOT EXISTS order_confirms(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, order_type TEXT, order_id INTEGER,
+          item_id INTEGER, qty INTEGER, amount REAL DEFAULT 0, profit REAL DEFAULT 0,
+          created_at TEXT);
         CREATE TABLE IF NOT EXISTS payments(
           id INTEGER PRIMARY KEY AUTOINCREMENT, order_type TEXT, order_id INTEGER,
           amount REAL, pay_date TEXT, note TEXT, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS idempotency_keys(
+          key TEXT PRIMARY KEY, order_type TEXT, order_id INTEGER,
+          order_no TEXT, created_at TEXT);
         """)
         # 轻量迁移: 老库补列 (自饮/赠送/破损/折扣新增字段, 已有行 type 默认 sale)
         for _t, _col, _ddl in (
+                ("inbound_orders", "voided", "INTEGER DEFAULT 0"),
+                ("inbound_orders", "voided_at", "TEXT"),
+                ("outbound_orders", "voided", "INTEGER DEFAULT 0"),
+                ("outbound_orders", "voided_at", "TEXT"),
+                ("transfers", "voided", "INTEGER DEFAULT 0"),
+                ("transfers", "voided_at", "TEXT"),
                 ("outbound_orders", "type", "TEXT DEFAULT 'sale'"),
                 ("outbound_orders", "cost_total", "REAL DEFAULT 0"),
                 ("outbound_orders", "orig_total", "REAL DEFAULT 0"),
@@ -117,7 +138,12 @@ def init_db():
                 ("outbound_items", "discount_rate", "REAL"),
                 ("outbound_items", "discount_amount", "REAL DEFAULT 0"),
                 ("outbound_items", "cost_price", "REAL DEFAULT 0"),
-                ("outbound_items", "reason", "TEXT")):
+                ("outbound_items", "reason", "TEXT"),
+                ("inbound_orders", "status", "TEXT DEFAULT 'pending'"),
+                ("inbound_items", "confirmed_qty", "INTEGER DEFAULT 0"),
+                ("outbound_orders", "status", "TEXT DEFAULT 'pending'"),
+                ("outbound_items", "confirmed_qty", "INTEGER DEFAULT 0"),
+                ("transfers", "status", "TEXT DEFAULT 'pending'")):
             _cols = [r[1] for r in c.execute(f"PRAGMA table_info({_t})")]
             if _col not in _cols:
                 c.execute(f"ALTER TABLE {_t} ADD COLUMN {_col} {_ddl}")
@@ -246,14 +272,14 @@ async def register_first_admin(request: Request):
             return err("用户名已存在")
         token = secrets.token_hex(32)
         exp = (datetime.now() + timedelta(hours=TOKEN_TTL_HOURS)).isoformat()
-        c.execute("INSERT INTO users(username,display_name,password_hash,"
+        c.execute("INSERT INTO users(username,password_hash,"
                   "must_change_password,session_token,session_expires_at,"
-                  "created_at) VALUES(?,?,?,?,?,?,?)",
-                  (username, username, hash_pw(password), 0, token, exp,
+                  "created_at) VALUES(?,?,?,?,?,?)",
+                  (username, hash_pw(password), 0, token, exp,
                    datetime.now().isoformat()))
         audit(c, username, "注册首位管理员", username, "首位管理员注册，注册已关闭")
         return {"token": token, "username": username,
-                "display_name": username, "must_change_password": False}
+                "must_change_password": False}
 
 
 # ---------- 登录 / 用户 ----------
@@ -272,7 +298,6 @@ async def login(request: Request):
                   (token, exp, r["id"]))
         audit(c, r["username"], "登录", r["username"], "登录成功")
         return {"token": token, "username": r["username"],
-                "display_name": r["display_name"],
                 "must_change_password": bool(r["must_change_password"])}
 
 
@@ -310,7 +335,7 @@ async def list_users(request: Request):
     if e:
         return e
     with conn() as c:
-        return rows(c, "SELECT id,username,display_name,active,"
+        return rows(c, "SELECT id,username,active,"
                        "must_change_password,created_at FROM users ORDER BY id")
 
 
@@ -326,9 +351,9 @@ async def create_user(request: Request):
         if c.execute("SELECT 1 FROM users WHERE username=?",
                      (b["username"],)).fetchone():
             return err("用户名已存在")
-        cur = c.execute("INSERT INTO users(username,display_name,password_hash,"
-                        "must_change_password,created_at) VALUES(?,?,?,?,?)",
-                        (b["username"], b.get("display_name", b["username"]),
+        cur = c.execute("INSERT INTO users(username,password_hash,"
+                        "must_change_password,created_at) VALUES(?,?,?,?)",
+                        (b["username"],
                          hash_pw(b["password"]), 1 if b.get("must_change_password")
                          else 0, datetime.now().isoformat()))
         audit(c, u["username"], "新增管理员", b["username"], "")
@@ -345,9 +370,6 @@ async def update_user(uid: int, request: Request):
         r = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
         if not r:
             return err("用户不存在", 404)
-        if "display_name" in b:
-            c.execute("UPDATE users SET display_name=? WHERE id=?",
-                      (b["display_name"], uid))
         if b.get("password"):
             c.execute("UPDATE users SET password_hash=?, must_change_password=? "
                       "WHERE id=?", (hash_pw(b["password"]),
@@ -356,7 +378,7 @@ async def update_user(uid: int, request: Request):
             c.execute("UPDATE users SET active=? WHERE id=?",
                       (1 if b["active"] else 0, uid))
         audit(c, u["username"], "修改管理员", r["username"],
-              f"display_name/active/password 更新")
+              "active/password 更新")
         return {"ok": True}
 
 
@@ -492,7 +514,12 @@ async def list_wh(request: Request):
     if e:
         return e
     with conn() as c:
-        return rows(c, "SELECT * FROM warehouses ORDER BY id")
+        whs = rows(c, "SELECT * FROM warehouses ORDER BY id")
+        for w in whs:
+            w["stock_total"] = c.execute(
+                "SELECT COALESCE(SUM(quantity),0) s FROM stock"
+                " WHERE warehouse_id=?", (w["id"],)).fetchone()["s"]
+        return whs
 
 
 @app.post("/api/warehouses")
@@ -501,9 +528,93 @@ async def create_wh(request: Request):
     if e:
         return e
     b = await request.json()
+    if not (b.get("name") or "").strip():
+        return err("仓库名称必填")
     with conn() as c:
-        cur = c.execute("INSERT INTO warehouses(name) VALUES(?)", (b.get("name"),))
+        cur = c.execute("INSERT INTO warehouses(name) VALUES(?)",
+                        (b["name"].strip(),))
+        audit(c, u["username"], "新增仓库", b["name"].strip(), "")
         return {"ok": True, "id": cur.lastrowid}
+
+
+@app.put("/api/warehouses/{wid}")
+async def update_wh(wid: int, request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    b = await request.json()
+    if not (b.get("name") or "").strip():
+        return err("仓库名称必填")
+    with conn() as c:
+        r = c.execute("SELECT * FROM warehouses WHERE id=?", (wid,)).fetchone()
+        if not r:
+            return err("仓库不存在", 404)
+        c.execute("UPDATE warehouses SET name=? WHERE id=?",
+                  (b["name"].strip(), wid))
+        audit(c, u["username"], "改名仓库", b["name"].strip(), "")
+        return {"ok": True}
+
+
+@app.delete("/api/warehouses/{wid}")
+async def delete_wh(wid: int, request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        r = c.execute("SELECT * FROM warehouses WHERE id=?", (wid,)).fetchone()
+        if not r:
+            return err("仓库不存在", 404)
+        n = c.execute("SELECT COUNT(*) FROM warehouses").fetchone()[0]
+        if n <= 1:
+            return err("不能删除最后一个仓库", 400)
+        stock = c.execute("SELECT COALESCE(SUM(quantity),0) s FROM stock"
+                          " WHERE warehouse_id=?", (wid,)).fetchone()["s"]
+        if stock > 0:
+            return err(f"该仓库还有库存 {stock} 瓶，不能删除", 400)
+        pend = c.execute("SELECT COUNT(*) FROM inbound_orders"
+                         " WHERE warehouse_id=? AND type='purchase'"
+                         " AND status IN ('pending','partial')",
+                         (wid,)).fetchone()[0]
+        pend += c.execute("SELECT COUNT(*) FROM outbound_orders"
+                          " WHERE warehouse_id=? AND type='sale'"
+                          " AND status IN ('pending','partial')",
+                          (wid,)).fetchone()[0]
+        pend += c.execute("SELECT COUNT(*) FROM transfers"
+                          " WHERE (from_warehouse_id=? OR to_warehouse_id=?)"
+                          " AND status='pending'", (wid, wid)).fetchone()[0]
+        if pend > 0:
+            return err(f"该仓库还有 {pend} 张未确认的单据，不能删除", 400)
+        c.execute("DELETE FROM warehouses WHERE id=?", (wid,))
+        audit(c, u["username"], "删除仓库", r["name"], "")
+        return {"ok": True}
+
+
+@app.get("/api/inventory")
+async def inventory(request: Request):
+    # 分仓库库存: 每组列酒名、规格、库存瓶数、成本小计, 只读查看
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        out = []
+        for w in rows(c, "SELECT * FROM warehouses ORDER BY id"):
+            items = rows(c, "SELECT s.wine_id, w.name AS wine_name, w.spec,"
+                         " s.quantity AS qty FROM stock s"
+                         " JOIN wines w ON w.id=s.wine_id"
+                         " WHERE s.warehouse_id=? AND s.quantity>0"
+                         " ORDER BY w.name", (w["id"],))
+            tot_qty = 0
+            tot_cost = 0.0
+            for it in items:
+                unit = latest_cost(c, it["wine_id"])
+                it["unit_cost"] = unit
+                it["cost"] = round(unit * it["qty"], 2)
+                tot_qty += it["qty"]
+                tot_cost += it["cost"]
+            out.append({"id": w["id"], "name": w["name"],
+                        "total_qty": tot_qty, "total_cost": round(tot_cost, 2),
+                        "items": items})
+        return {"warehouses": out}
 
 
 def party_routes(kind, table):
@@ -515,20 +626,26 @@ def party_routes(kind, table):
             ps = rows(c, f"SELECT * FROM {table} ORDER BY id DESC")
             for p in ps:
                 if kind == "supplier":
-                    t = c.execute("SELECT COALESCE(SUM(goods_total),0) tot FROM "
-                                  "inbound_orders WHERE supplier_id=? AND type='purchase'",
+                    t = c.execute("SELECT COALESCE(SUM(i.confirmed_qty*i.unit_price),0)"
+                                  " tot FROM inbound_items i JOIN inbound_orders o"
+                                  " ON o.id=i.order_id WHERE o.supplier_id=?"
+                                  " AND o.type='purchase' AND COALESCE(o.voided,0)=0",
                                   (p["id"],)).fetchone()["tot"]
                     paid = c.execute("SELECT COALESCE(SUM(p.amount),0) s FROM payments p "
                                      "JOIN inbound_orders o ON o.id=p.order_id "
                                      "WHERE p.order_type='inbound' AND o.supplier_id=? "
-                                     "AND o.type='purchase'", (p["id"],)).fetchone()["s"]
+                                     "AND o.type='purchase' AND COALESCE(o.voided,0)=0",
+                                     (p["id"],)).fetchone()["s"]
                 else:
-                    t = c.execute("SELECT COALESCE(SUM(sale_total),0) tot FROM "
-                                  "outbound_orders WHERE customer_id=? AND type='sale'",
+                    t = c.execute("SELECT COALESCE(SUM(i.confirmed_qty*i.unit_price),0)"
+                                  " tot FROM outbound_items i JOIN outbound_orders o"
+                                  " ON o.id=i.order_id WHERE o.customer_id=?"
+                                  " AND o.type='sale' AND COALESCE(o.voided,0)=0",
                                   (p["id"],)).fetchone()["tot"]
                     paid = c.execute("SELECT COALESCE(SUM(p.amount),0) s FROM payments p "
                                      "JOIN outbound_orders o ON o.id=p.order_id "
-                                     "WHERE p.order_type='outbound' AND o.customer_id=?",
+                                     "WHERE p.order_type='outbound' AND o.customer_id=?"
+                                     " AND COALESCE(o.voided,0)=0",
                                      (p["id"],)).fetchone()["s"]
                 p["balance"] = round(t - paid, 2)
                 if kind == "customer":
@@ -536,7 +653,8 @@ def party_routes(kind, table):
                                   " COALESCE(SUM(i.qty*i.cost_price),0) c"
                                   " FROM outbound_items i JOIN outbound_orders o"
                                   " ON o.id=i.order_id"
-                                  " WHERE o.type='gift' AND o.customer_id=?",
+                                  " WHERE o.type='gift' AND o.customer_id=?"
+                                  " AND COALESCE(o.voided,0)=0",
                                   (p["id"],)).fetchone()
                     p["gift_qty"] = int(g["q"])
                     p["gift_cost"] = round(g["c"], 2)
@@ -595,7 +713,7 @@ async def delete_supplier(pid: int, request: Request):
         r = c.execute("SELECT * FROM suppliers WHERE id=?", (pid,)).fetchone()
         if not r:
             return err("供应商不存在", 404)
-        n = c.execute("SELECT COUNT(*) FROM inbound_orders WHERE supplier_id=? AND type='purchase'", (pid,)).fetchone()[0]
+        n = c.execute("SELECT COUNT(*) FROM inbound_orders WHERE supplier_id=? AND type='purchase' AND COALESCE(voided,0)=0", (pid,)).fetchone()[0]
         if n > 0:
             return JSONResponse({"detail": "该供应商已有进货单，不能删除"}, status_code=400)
         c.execute("DELETE FROM suppliers WHERE id=?", (pid,))
@@ -612,7 +730,7 @@ async def delete_customer(pid: int, request: Request):
         r = c.execute("SELECT * FROM customers WHERE id=?", (pid,)).fetchone()
         if not r:
             return err("客户不存在", 404)
-        n = c.execute("SELECT COUNT(*) FROM outbound_orders WHERE customer_id=?", (pid,)).fetchone()[0]
+        n = c.execute("SELECT COUNT(*) FROM outbound_orders WHERE customer_id=? AND COALESCE(voided,0)=0", (pid,)).fetchone()[0]
         if n > 0:
             return JSONResponse({"detail": "该客户已有出货单，不能删除"}, status_code=400)
         c.execute("DELETE FROM customers WHERE id=?", (pid,))
@@ -642,9 +760,50 @@ def get_stock(c, wh, wine, batch=""):
 
 
 def paid_total(c, otype, oid):
+    # 已作废的单: 已付同步冲回, 按 0 算
+    table = "inbound_orders" if otype == "inbound" else "outbound_orders"
+    o = c.execute(f"SELECT voided FROM {table} WHERE id=?", (oid,)).fetchone()
+    if o and o["voided"]:
+        return 0.0
     r = c.execute("SELECT COALESCE(SUM(amount),0) s FROM payments WHERE order_type=?"
                   " AND order_id=?", (otype, oid)).fetchone()
     return r["s"]
+
+
+def idem_lookup(c, key):
+    """幂等键查原单: 有则返回键记录, 无则返回 None."""
+    if not key:
+        return None
+    return c.execute("SELECT * FROM idempotency_keys WHERE key=?",
+                     (key,)).fetchone()
+
+
+def idem_response(c, row):
+    """按原单重建创建成功时的返回体, 不重复建单."""
+    otype, oid = row["order_type"], row["order_id"]
+    if otype == "transfer":
+        tr = c.execute("SELECT * FROM transfers WHERE id=?", (oid,)).fetchone()
+        return {"ok": True, "transfer_no": tr["transfer_no"], "duplicate": True}
+    if otype == "inbound":
+        o = c.execute("SELECT * FROM inbound_orders WHERE id=?", (oid,)).fetchone()
+        return {"ok": True, "id": oid, "order_no": o["order_no"],
+                "goods_total": o["goods_total"], "freight": o["freight"],
+                "duplicate": True}
+    o = c.execute("SELECT * FROM outbound_orders WHERE id=?", (oid,)).fetchone()
+    return {"ok": True, "id": oid, "order_no": o["order_no"], "type": o["type"],
+            "sale_total": o["sale_total"], "orig_total": o["orig_total"],
+            "discount_total": o["discount_total"], "cost_total": o["cost_total"],
+            "pay_status": o["pay_status"], "freight": o["freight"],
+            "duplicate": True}
+
+
+def idem_store(c, key, otype, oid, order_no):
+    """建单成功后记下幂等键, 同一键再来直接返回原单."""
+    if key:
+        c.execute("INSERT OR IGNORE INTO idempotency_keys"
+                  "(key,order_type,order_id,order_no,created_at)"
+                  " VALUES(?,?,?,?,?)",
+                  (key, otype, oid, order_no, datetime.now().isoformat()))
 
 
 def pay_status(paid, total):
@@ -653,6 +812,46 @@ def pay_status(paid, total):
     if paid + 1e-9 >= total:
         return "paid"
     return "partial"
+
+
+def confirmed_total(c, table, items_table, oid):
+    """已确认货值: 明细 confirmed_qty * 单价之和 (未确认的不算)."""
+    r = c.execute(f"SELECT COALESCE(SUM(confirmed_qty*unit_price),0) s"
+                  f" FROM {items_table} WHERE order_id=?", (oid,)).fetchone()
+    return r["s"]
+
+
+def pay_status_confirmed(c, table, items_table, oid, paid):
+    """按已确认货值算付款状态: 没确认过时已付算预付, 显示 partial."""
+    tot = confirmed_total(c, table, items_table, oid)
+    if tot <= 0:
+        return "unpaid" if paid <= 0 else "partial"
+    return pay_status(paid, tot)
+
+
+def order_status_after(c, table, items_table, oid, final_status):
+    """按明细确认进度推导单据状态: 全确认 -> final_status, 部分 -> partial, 无 -> pending."""
+    r = c.execute(f"SELECT COALESCE(SUM(qty),0) q,"
+                  f" COALESCE(SUM(confirmed_qty),0) cq FROM {items_table}"
+                  f" WHERE order_id=?", (oid,)).fetchone()
+    if r["cq"] <= 0:
+        return "pending"
+    if r["cq"] + 1e-9 >= r["q"]:
+        return final_status
+    return "partial"
+
+
+def refresh_order_pay_status(c, table, items_table, oid):
+    """确认/废单后同步 pay_status (按已确认货值算)."""
+    o = c.execute(f"SELECT * FROM {table} WHERE id=?", (oid,)).fetchone()
+    if not o:
+        return
+    if table == "outbound_orders" and o["type"] != "sale":
+        return
+    paid = paid_total(c, "inbound" if table == "inbound_orders" else "outbound",
+                      oid)
+    c.execute(f"UPDATE {table} SET pay_status=? WHERE id=?",
+              (pay_status_confirmed(c, table, items_table, oid, paid), oid))
 
 
 def latest_cost(c, wine_id):
@@ -680,21 +879,29 @@ async def dashboard(request: Request):
     today = date.today().isoformat()
     month = date.today().strftime("%Y-%m")
     with conn() as c:
-        sales = c.execute("SELECT COALESCE(SUM(sale_total),0) s FROM outbound_orders"
-                          " WHERE order_date=? AND type='sale'", (today,)).fetchone()["s"]
-        profit = 0.0
-        for it in rows(c, "SELECT i.* FROM outbound_items i JOIN outbound_orders o"
-                          " ON o.id=i.order_id WHERE o.order_date=? AND o.type='sale'", (today,)):
-            profit += (it["unit_price"] - latest_cost(c, it["wine_id"])) * it["qty"]
-        cust_debt = c.execute(
-            "SELECT COALESCE(SUM(sale_total),0) FROM outbound_orders WHERE type='sale'").fetchone()[0] \
-            - c.execute("SELECT COALESCE(SUM(amount),0) FROM payments "
-                        "WHERE order_type='outbound'").fetchone()[0]
-        sup_debt = c.execute(
-            "SELECT COALESCE(SUM(goods_total),0) FROM inbound_orders "
-            "WHERE type='purchase'").fetchone()[0] \
-            - c.execute("SELECT COALESCE(SUM(amount),0) FROM payments "
-                        "WHERE order_type='inbound'").fetchone()[0]
+        # 今日销售额/毛利: 只算今天确认的销售单已确认部分 (确认时间, 不是下单时间)
+        sales = c.execute("SELECT COALESCE(SUM(oc.amount),0) s FROM order_confirms oc"
+                          " JOIN outbound_orders o ON o.id=oc.order_id"
+                          " WHERE oc.order_type='outbound' AND o.type='sale'"
+                          " AND substr(oc.created_at,1,10)=?", (today,)).fetchone()["s"]
+        profit = c.execute("SELECT COALESCE(SUM(oc.profit),0) s FROM order_confirms oc"
+                           " JOIN outbound_orders o ON o.id=oc.order_id"
+                           " WHERE oc.order_type='outbound' AND o.type='sale'"
+                           " AND substr(oc.created_at,1,10)=?",
+                           (today,)).fetchone()["s"]
+        # 欠款: 只算已确认货值 - 已付 (未确认的单不计入)
+        cust_debt = 0.0
+        for o in rows(c, "SELECT id FROM outbound_orders"
+                         " WHERE type='sale' AND COALESCE(voided,0)=0"):
+            cust_debt += (confirmed_total(c, "outbound_orders", "outbound_items",
+                                          o["id"])
+                          - paid_total(c, "outbound", o["id"]))
+        sup_debt = 0.0
+        for o in rows(c, "SELECT id FROM inbound_orders"
+                         " WHERE type='purchase' AND COALESCE(voided,0)=0"):
+            sup_debt += (confirmed_total(c, "inbound_orders", "inbound_items",
+                                         o["id"])
+                         - paid_total(c, "inbound", o["id"]))
         low = rows(c, "SELECT w.id, w.name, w.spec, COALESCE(SUM(s.quantity),0) qty"
                       " FROM wines w LEFT JOIN stock s ON s.wine_id=w.id"
                       " GROUP BY w.id HAVING qty < ?", (LOW_STOCK_THRESHOLD,))
@@ -703,15 +910,18 @@ async def dashboard(request: Request):
             r = c.execute("SELECT COALESCE(SUM(i.qty),0) q,"
                           " COALESCE(SUM(i.qty*i.cost_price),0) c FROM outbound_items i"
                           " JOIN outbound_orders o ON o.id=i.order_id"
-                          " WHERE o.type=? AND substr(o.order_date,1,7)=?",
+                          " WHERE o.type=? AND substr(o.order_date,1,7)=?"
+                          " AND COALESCE(o.voided,0)=0",
                           (typ, month)).fetchone()
             return int(r["q"]), round(r["c"], 2)
         pq, pc = month_stat("personal")
         gq, gc = month_stat("gift")
         dq, dc = month_stat("damage")
         month_discount = c.execute(
-            "SELECT COALESCE(SUM(discount_total),0) FROM outbound_orders"
-            " WHERE type='sale' AND substr(order_date,1,7)=?", (month,)).fetchone()[0]
+            "SELECT COALESCE(SUM((i.orig_price-i.unit_price)*i.confirmed_qty),0)"
+            " FROM outbound_items i JOIN outbound_orders o ON o.id=i.order_id"
+            " WHERE o.type='sale' AND substr(o.order_date,1,7)=?"
+            " AND COALESCE(o.voided,0)=0", (month,)).fetchone()[0]
         return {"today_sales": round(sales, 2), "today_profit": round(profit, 2),
                 "customer_debt": round(cust_debt, 2),
                 "supplier_debt": round(sup_debt, 2),
@@ -739,24 +949,33 @@ async def create_inbound(request: Request):
     goods = sum(float(i.get("qty", 0)) * float(i.get("unit_price") or 0)
                 for i in items)
     with conn() as c:
+        _key = (b.get("idempotency_key") or "").strip() or None
+        _dup = idem_lookup(c, _key)
+        if _dup is not None:
+            return idem_response(c, _dup)
         no = next_order_no(c, "inbound_orders", "BD" if typ == "opening" else "RK")
+        # 两段式: purchase 下单时状态待到货, 不加库存、不算欠款, 确认到货才动;
+        # opening 补登是库存调整, 立即生效
+        status = "received" if typ == "opening" else "pending"
         cur = c.execute(
             "INSERT INTO inbound_orders(order_no,type,supplier_id,warehouse_id,"
             "order_date,carrier,tracking_no,freight,freight_free,freight_payer,"
-            "goods_total,pay_status,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "goods_total,pay_status,note,created_at,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (no, typ, b.get("supplier_id"), b.get("warehouse_id"),
              b.get("order_date") or date.today().isoformat(), b.get("carrier"),
              b.get("tracking_no"), freight, 1 if b.get("freight_free") else 0,
              b.get("freight_payer"), round(goods, 2), "unpaid", b.get("note"),
-             datetime.now().isoformat()))
+             datetime.now().isoformat(), status))
         oid = cur.lastrowid
         for i in items:
-            c.execute("INSERT INTO inbound_items(order_id,wine_id,batch,qty,unit_price)"
-                      " VALUES(?,?,?,?,?)",
+            c.execute("INSERT INTO inbound_items(order_id,wine_id,batch,qty,unit_price,"
+                      "confirmed_qty) VALUES(?,?,?,?,?,?)",
                       (oid, i["wine_id"], i.get("batch") or "",
-                       int(i["qty"]), float(i.get("unit_price") or 0)))
-            add_stock(c, b["warehouse_id"], i["wine_id"], i.get("batch") or "",
-                      int(i["qty"]))
+                       int(i["qty"]), float(i.get("unit_price") or 0),
+                       int(i["qty"]) if typ == "opening" else 0))
+            if typ == "opening":
+                add_stock(c, b["warehouse_id"], i["wine_id"], i.get("batch") or "",
+                          int(i["qty"]))
         paid = float(b.get("paid_amount") or 0)
         if paid > 0:
             c.execute("INSERT INTO payments(order_type,order_id,amount,pay_date,note,"
@@ -764,11 +983,13 @@ async def create_inbound(request: Request):
                       (oid, paid, date.today().isoformat(), "建单时已付",
                        datetime.now().isoformat()))
         c.execute("UPDATE inbound_orders SET pay_status=? WHERE id=?",
-                  (pay_status(paid, goods), oid))
+                  (pay_status_confirmed(c, "inbound_orders", "inbound_items", oid,
+                                        paid), oid))
         audit(c, u["username"], "补登期初" if typ == "opening" else "进货",
               no, f"货款{goods:.2f} 运费{freight:.2f}")
+        idem_store(c, _key, "inbound", oid, no)
         return {"ok": True, "id": oid, "order_no": no, "goods_total": round(goods, 2),
-                "freight": freight}
+                "freight": freight, "status": status}
 
 
 @app.get("/api/inbound")
@@ -823,6 +1044,10 @@ async def create_outbound(request: Request):
         return err("自饮/破损不需要客户")
     wh = b.get("warehouse_id")
     with conn() as c:
+        _key = (b.get("idempotency_key") or "").strip() or None
+        _dup = idem_lookup(c, _key)
+        if _dup is not None:
+            return idem_response(c, _dup)
         for i in items:  # 先校验全部, 不足拦住, 不允许负库存
             have = get_stock(c, wh, i["wine_id"], i.get("batch") or "")
             if int(i["qty"]) > have:
@@ -878,27 +1103,32 @@ async def create_outbound(request: Request):
             freight, total, orig_total, disc_total = 0.0, 0.0, 0.0, 0.0
         cost_total = round(sum(l["qty"] * l["cost_price"] for l in lines), 2)
         no = next_order_no(c, "outbound_orders", "CK")
+        # 两段式: sale 下单时状态待出货, 不减库存、不算欠款, 确认出货才动;
+        # 自饮/赠送/破损立即生效
+        status = "done" if typ != "sale" else "pending"
         cur = c.execute(
             "INSERT INTO outbound_orders(order_no,type,customer_id,warehouse_id,"
             "order_date,carrier,tracking_no,freight,freight_free,freight_payer,"
-            "sale_total,orig_total,discount_total,cost_total,pay_status,note,created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "sale_total,orig_total,discount_total,cost_total,pay_status,note,created_at,"
+            "status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (no, typ, b.get("customer_id") if typ in ("sale", "gift") else None,
              wh, b.get("order_date") or date.today().isoformat(),
              b.get("carrier"), b.get("tracking_no"), freight,
              1 if b.get("freight_free") else 0, b.get("freight_payer"),
              total, orig_total, disc_total, cost_total,
              "unpaid" if typ == "sale" else "paid",
-             b.get("note"), datetime.now().isoformat()))
+             b.get("note"), datetime.now().isoformat(), status))
         oid = cur.lastrowid
         for l in lines:
             c.execute("INSERT INTO outbound_items(order_id,wine_id,batch,qty,unit_price,"
-                      "orig_price,discount_rate,discount_amount,cost_price,reason)"
-                      " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                      "orig_price,discount_rate,discount_amount,cost_price,reason,"
+                      "confirmed_qty) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                       (oid, l["wine_id"], l["batch"], l["qty"], l["unit_price"],
                        l["orig_price"], l["discount_rate"], l["discount_amount"],
-                       l["cost_price"], l["reason"]))
-            add_stock(c, wh, l["wine_id"], l["batch"], -l["qty"])
+                       l["cost_price"], l["reason"],
+                       l["qty"] if typ != "sale" else 0))
+            if typ != "sale":
+                add_stock(c, wh, l["wine_id"], l["batch"], -l["qty"])
         paid = float(b.get("paid_amount") or 0) if typ == "sale" else 0.0
         if paid > 0:
             c.execute("INSERT INTO payments(order_type,order_id,amount,pay_date,note,"
@@ -907,7 +1137,8 @@ async def create_outbound(request: Request):
                        datetime.now().isoformat()))
         if typ == "sale":
             c.execute("UPDATE outbound_orders SET pay_status=? WHERE id=?",
-                      (pay_status(paid, total), oid))
+                      (pay_status_confirmed(c, "outbound_orders", "outbound_items",
+                                            oid, paid), oid))
         action = {"sale": "出货", "personal": "自饮", "gift": "赠送",
                   "damage": "破损"}[typ]
         note = (f"货款{total:.2f} 运费{freight:.2f}" if typ == "sale"
@@ -915,11 +1146,14 @@ async def create_outbound(request: Request):
         if disc_total:
             note += f" 折扣{disc_total:.2f}"
         audit(c, u["username"], action, no, note)
+        idem_store(c, _key, "outbound", oid, no)
         return {"ok": True, "id": oid, "order_no": no, "type": typ,
                 "sale_total": total, "orig_total": orig_total,
                 "discount_total": disc_total, "cost_total": cost_total,
-                "pay_status": pay_status(paid, total) if typ == "sale" else "paid",
-                "freight": freight}
+                "pay_status": pay_status_confirmed(
+                    c, "outbound_orders", "outbound_items", oid, paid)
+                if typ == "sale" else "paid",
+                "freight": freight, "status": status}
 
 
 @app.get("/api/outbound")
@@ -966,16 +1200,19 @@ async def customer_gifts(cid: int, request: Request):
         tot = c.execute("SELECT COALESCE(SUM(i.qty),0) q,"
                         " COALESCE(SUM(i.qty*i.cost_price),0) c FROM outbound_items i"
                         " JOIN outbound_orders o ON o.id=i.order_id"
-                        " WHERE o.type='gift' AND o.customer_id=?", (cid,)).fetchone()
+                        " WHERE o.type='gift' AND o.customer_id=?"
+                        " AND COALESCE(o.voided,0)=0", (cid,)).fetchone()
         by_wine = rows(c, "SELECT w.id AS wine_id, w.name AS wine_name,"
                           " COALESCE(SUM(i.qty),0) qty,"
                           " COALESCE(SUM(i.qty*i.cost_price),0) cost"
                           " FROM outbound_items i JOIN outbound_orders o ON o.id=i.order_id"
                           " JOIN wines w ON w.id=i.wine_id"
-                          " WHERE o.type='gift' AND o.customer_id=? GROUP BY w.id", (cid,))
+                          " WHERE o.type='gift' AND o.customer_id=?"
+                          " AND COALESCE(o.voided,0)=0 GROUP BY w.id", (cid,))
         orders = rows(c, "SELECT o.*, COALESCE(SUM(i.qty),0) qty FROM outbound_orders o"
                          " LEFT JOIN outbound_items i ON i.order_id=o.id"
                          " WHERE o.type='gift' AND o.customer_id=?"
+                         " AND COALESCE(o.voided,0)=0"
                          " GROUP BY o.id ORDER BY o.id DESC", (cid,))
         return {"customer": dict(cus), "total_qty": int(tot["q"]),
                 "total_cost": round(tot["c"], 2), "by_wine": by_wine, "orders": orders}
@@ -998,6 +1235,8 @@ async def add_payment(otype: str, oid: int, request: Request):
         o = c.execute(f"SELECT * FROM {table} WHERE id=?", (oid,)).fetchone()
         if not o:
             return err("单据不存在", 404)
+        if o["voided"]:
+            return err("已作废的单据不能补记", 400)
         if otype == "outbound" and o["type"] != "sale":
             return err("自饮/赠送/破损单不产生应收, 不能补记收款")
         c.execute("INSERT INTO payments(order_type,order_id,amount,pay_date,note,"
@@ -1005,12 +1244,12 @@ async def add_payment(otype: str, oid: int, request: Request):
                   (otype, oid, amt, b.get("pay_date") or date.today().isoformat(),
                    b.get("note"), datetime.now().isoformat()))
         paid = paid_total(c, otype, oid)
-        c.execute(f"UPDATE {table} SET pay_status=? WHERE id=?",
-                  (pay_status(paid, o[total_field]), oid))
+        items_table = "inbound_items" if otype == "inbound" else "outbound_items"
+        st = pay_status_confirmed(c, table, items_table, oid, paid)
+        c.execute(f"UPDATE {table} SET pay_status=? WHERE id=?", (st, oid))
         audit(c, u["username"], "收款" if otype == "outbound" else "付款",
               o["order_no"], f"补记 {amt:.2f}")
-        return {"ok": True, "paid_amount": paid,
-                "pay_status": pay_status(paid, o[total_field])}
+        return {"ok": True, "paid_amount": paid, "pay_status": st}
 
 
 @app.post("/api/transfers")
@@ -1025,20 +1264,24 @@ async def create_transfer(request: Request):
     if b.get("from_warehouse_id") == b.get("to_warehouse_id"):
         return err("调出和调入仓库不能相同")
     with conn() as c:
+        _key = (b.get("idempotency_key") or "").strip() or None
+        _dup = idem_lookup(c, _key)
+        if _dup is not None:
+            return idem_response(c, _dup)
         have = get_stock(c, b["from_warehouse_id"], b["wine_id"], b.get("batch") or "")
         if qty > have:
             return err(f"源仓库存不足, 现有 {have} 瓶")
         no = next_order_no(c, "transfers", "DB", col="transfer_no")
-        c.execute("INSERT INTO transfers(transfer_no,from_warehouse_id,"
-                  "to_warehouse_id,wine_id,batch,qty,created_at,note)"
-                  " VALUES(?,?,?,?,?,?,?,?)",
-                  (no, b["from_warehouse_id"], b["to_warehouse_id"], b["wine_id"],
-                   b.get("batch") or "", qty, datetime.now().isoformat(),
-                   b.get("note")))
-        add_stock(c, b["from_warehouse_id"], b["wine_id"], b.get("batch") or "", -qty)
-        add_stock(c, b["to_warehouse_id"], b["wine_id"], b.get("batch") or "", qty)
-        audit(c, u["username"], "调拨", no, f"{qty} 瓶")
-        return {"ok": True, "transfer_no": no}
+        cur = c.execute("INSERT INTO transfers(transfer_no,from_warehouse_id,"
+                        "to_warehouse_id,wine_id,batch,qty,created_at,note,status)"
+                        " VALUES(?,?,?,?,?,?,?,?,?)",
+                        (no, b["from_warehouse_id"], b["to_warehouse_id"], b["wine_id"],
+                         b.get("batch") or "", qty, datetime.now().isoformat(),
+                         b.get("note"), "pending"))
+        tid = cur.lastrowid
+        audit(c, u["username"], "调拨下单", no, f"{qty} 瓶 (待调拨)")
+        idem_store(c, _key, "transfer", tid, no)
+        return {"ok": True, "transfer_no": no, "status": "pending"}
 
 
 @app.get("/api/transfers")
@@ -1049,6 +1292,227 @@ async def list_transfers(request: Request):
     with conn() as c:
         return rows(c, "SELECT t.*, w.name AS wine_name FROM transfers t"
                        " JOIN wines w ON w.id=t.wine_id ORDER BY t.id DESC")
+
+
+@app.post("/api/inbound/{oid}/confirm")
+async def confirm_inbound(oid: int, request: Request):
+    """确认到货: 按行确认数量 (默认剩余全部), 确认多少加多少库存、算多少欠款."""
+    u, e = await require_user(request)
+    if e:
+        return e
+    b = await request.json()
+    with conn() as c:
+        o = c.execute("SELECT * FROM inbound_orders WHERE id=?", (oid,)).fetchone()
+        if not o:
+            return err("单据不存在", 404)
+        if o["type"] == "opening":
+            return err("补登单无需确认到货", 400)
+        if o["voided"]:
+            return err("已废单，不能确认", 400)
+        if o["status"] in ("received", "closed"):
+            return err("该单已确认完或已关闭，不能再确认", 400)
+        items = rows(c, "SELECT * FROM inbound_items WHERE order_id=?", (oid,))
+        by_id = {it["id"]: it for it in items}
+        req_items = b.get("items")
+        if req_items is None:
+            req_items = [{"item_id": it["id"],
+                          "qty": it["qty"] - it["confirmed_qty"]} for it in items]
+        now = datetime.now().isoformat()
+        total_qty = 0
+        total_amt = 0.0
+        for ri in req_items:
+            it = by_id.get(int(ri.get("item_id") or 0))
+            if not it:
+                return err("明细不存在", 400)
+            q = int(ri.get("qty") or 0)
+            remain = it["qty"] - it["confirmed_qty"]
+            if q <= 0:
+                return err("确认数量必须大于 0", 400)
+            if q > remain:
+                return err(f"{it['wine_id']} 号酒确认数量超过剩余未到货数量 ({remain} 瓶)",
+                           400)
+            c.execute("UPDATE inbound_items SET confirmed_qty=confirmed_qty+?"
+                      " WHERE id=?", (q, it["id"]))
+            add_stock(c, o["warehouse_id"], it["wine_id"], it["batch"] or "", q)
+            amt = round(q * it["unit_price"], 2)
+            c.execute("INSERT INTO order_confirms(order_type,order_id,item_id,qty,"
+                      "amount,profit,created_at) VALUES('inbound',?,?,?,?,?,?)",
+                      (oid, it["id"], q, amt, 0.0, now))
+            total_qty += q
+            total_amt += amt
+        st = order_status_after(c, "inbound_orders", "inbound_items", oid, "received")
+        c.execute("UPDATE inbound_orders SET status=? WHERE id=?", (st, oid))
+        refresh_order_pay_status(c, "inbound_orders", "inbound_items", oid)
+        audit(c, u["username"], "确认到货", o["order_no"],
+              f"确认 {total_qty} 瓶, 货值 {total_amt:.2f}")
+        return {"ok": True, "order_no": o["order_no"], "status": st,
+                "confirmed_qty": total_qty, "confirmed_amount": round(total_amt, 2)}
+
+
+@app.post("/api/outbound/{oid}/confirm")
+async def confirm_outbound(oid: int, request: Request):
+    """确认出货: 按行确认数量 (默认剩余全部), 确认多少减多少库存、算多少欠款."""
+    u, e = await require_user(request)
+    if e:
+        return e
+    b = await request.json()
+    with conn() as c:
+        o = c.execute("SELECT * FROM outbound_orders WHERE id=?", (oid,)).fetchone()
+        if not o:
+            return err("单据不存在", 404)
+        if o["type"] != "sale":
+            return err("自饮/赠送/破损单建单即生效，无需确认", 400)
+        if o["voided"]:
+            return err("已废单，不能确认", 400)
+        if o["status"] in ("shipped", "closed"):
+            return err("该单已确认完或已关闭，不能再确认", 400)
+        items = rows(c, "SELECT * FROM outbound_items WHERE order_id=?", (oid,))
+        by_id = {it["id"]: it for it in items}
+        req_items = b.get("items")
+        if req_items is None:
+            req_items = [{"item_id": it["id"],
+                          "qty": it["qty"] - it["confirmed_qty"]} for it in items]
+        now = datetime.now().isoformat()
+        total_qty = 0
+        total_amt = 0.0
+        for ri in req_items:
+            it = by_id.get(int(ri.get("item_id") or 0))
+            if not it:
+                return err("明细不存在", 400)
+            q = int(ri.get("qty") or 0)
+            remain = it["qty"] - it["confirmed_qty"]
+            if q <= 0:
+                return err("确认数量必须大于 0", 400)
+            if q > remain:
+                return err("确认数量超过剩余未出货数量", 400)
+            have = get_stock(c, o["warehouse_id"], it["wine_id"], it["batch"] or "")
+            if q > have:
+                w = c.execute("SELECT name FROM wines WHERE id=?",
+                              (it["wine_id"],)).fetchone()
+                return err(f"库存不足: {w['name'] if w else it['wine_id']} "
+                           f"现有 {have} 瓶, 要出 {q} 瓶")
+            c.execute("UPDATE outbound_items SET confirmed_qty=confirmed_qty+?"
+                      " WHERE id=?", (q, it["id"]))
+            add_stock(c, o["warehouse_id"], it["wine_id"], it["batch"] or "", -q)
+            amt = round(q * it["unit_price"], 2)
+            prof = round(q * (it["unit_price"] - (it["cost_price"] or 0)), 2)
+            c.execute("INSERT INTO order_confirms(order_type,order_id,item_id,qty,"
+                      "amount,profit,created_at) VALUES('outbound',?,?,?,?,?,?)",
+                      (oid, it["id"], q, amt, prof, now))
+            total_qty += q
+            total_amt += amt
+        st = order_status_after(c, "outbound_orders", "outbound_items", oid, "shipped")
+        c.execute("UPDATE outbound_orders SET status=? WHERE id=?", (st, oid))
+        refresh_order_pay_status(c, "outbound_orders", "outbound_items", oid)
+        audit(c, u["username"], "确认出货", o["order_no"],
+              f"确认 {total_qty} 瓶, 金额 {total_amt:.2f}")
+        return {"ok": True, "order_no": o["order_no"], "status": st,
+                "confirmed_qty": total_qty, "confirmed_amount": round(total_amt, 2)}
+
+
+@app.post("/api/transfers/{tid}/confirm")
+async def confirm_transfer(tid: int, request: Request):
+    """确认调拨: 整单确认, 确认后才调库存."""
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        tr = c.execute("SELECT * FROM transfers WHERE id=?", (tid,)).fetchone()
+        if not tr:
+            return err("单据不存在", 404)
+        if tr["voided"]:
+            return err("已废单，不能确认", 400)
+        if tr["status"] == "done":
+            return err("该调拨已完成，不能重复确认", 400)
+        have = get_stock(c, tr["from_warehouse_id"], tr["wine_id"],
+                         tr["batch"] or "")
+        if tr["qty"] > have:
+            return err(f"源仓库存不足, 现有 {have} 瓶")
+        add_stock(c, tr["from_warehouse_id"], tr["wine_id"], tr["batch"] or "",
+                  -tr["qty"])
+        add_stock(c, tr["to_warehouse_id"], tr["wine_id"], tr["batch"] or "",
+                  tr["qty"])
+        c.execute("INSERT INTO order_confirms(order_type,order_id,item_id,qty,"
+                  "amount,profit,created_at) VALUES('transfer',?,NULL,?,0,0,?)",
+                  (tid, tr["qty"], datetime.now().isoformat()))
+        c.execute("UPDATE transfers SET status='done' WHERE id=?", (tid,))
+        audit(c, u["username"], "确认调拨", tr["transfer_no"], f"{tr['qty']} 瓶")
+        return {"ok": True, "transfer_no": tr["transfer_no"], "status": "done"}
+
+
+@app.post("/api/orders/{kind}/{oid}/void")
+async def void_order(kind: str, oid: int, request: Request):
+    """废单 (两段式新语义): 只取消未确认的部分, 已确认的部分保留.
+    没确认过 -> 整单废 (status=voided); 部分确认过 -> 废掉剩余, 单据变已关闭;
+    全部确认完 -> 400 不能废. 补登和自饮/赠送/破损是立即生效的单,
+    废单按原单反向冲库存 (v2.3.0 的做法)."""
+    u, e = await require_user(request)
+    if e:
+        return e
+    if kind not in ("inbound", "outbound", "transfers"):
+        return err("kind 只能是 inbound/outbound/transfers")
+    now = datetime.now().isoformat()
+    with conn() as c:
+        if kind == "transfers":
+            tr = c.execute("SELECT * FROM transfers WHERE id=?", (oid,)).fetchone()
+            if not tr:
+                return err("单据不存在", 404)
+            if tr["voided"]:
+                return err("该单据已废单，不能重复废单", 400)
+            if tr["status"] == "done":
+                return err("调拨已完成，不能废单", 400)
+            c.execute("UPDATE transfers SET voided=1, voided_at=?, status='voided'"
+                      " WHERE id=?", (now, oid))
+            audit(c, u["username"], "废调拨", tr["transfer_no"],
+                  f"{tr['qty']} 瓶")
+            return {"ok": True, "transfer_no": tr["transfer_no"],
+                    "status": "voided"}
+        table = "inbound_orders" if kind == "inbound" else "outbound_orders"
+        items_table = "inbound_items" if kind == "inbound" else "outbound_items"
+        o = c.execute(f"SELECT * FROM {table} WHERE id=?", (oid,)).fetchone()
+        if not o:
+            return err("单据不存在", 404)
+        if o["voided"]:
+            return err("该单据已废单，不能重复废单", 400)
+        if o["status"] == "closed":
+            return err("该单据已关闭，不能重复废单", 400)
+        immediate = (kind == "inbound" and o["type"] == "opening") or \
+            (kind == "outbound" and o["type"] != "sale")
+        if immediate:
+            # 立即生效的单: 废单 = 按原单反向冲库存
+            items = rows(c, f"SELECT * FROM {items_table} WHERE order_id=?", (oid,))
+            if kind == "inbound":
+                for it in items:
+                    add_stock(c, o["warehouse_id"], it["wine_id"],
+                              it["batch"] or "", -it["qty"])
+                action = "废补登"
+            else:
+                for it in items:
+                    add_stock(c, o["warehouse_id"], it["wine_id"],
+                              it["batch"] or "", it["qty"])
+                action = {"personal": "废自饮", "gift": "废赠送",
+                          "damage": "废破损"}[o["type"]]
+            c.execute(f"UPDATE {table} SET voided=1, voided_at=?, status='voided'"
+                      " WHERE id=?", (now, oid))
+            audit(c, u["username"], action, o["order_no"], "")
+            return {"ok": True, "order_no": o["order_no"], "status": "voided"}
+        # 两段式: 按已确认进度决定
+        r = c.execute(f"SELECT COALESCE(SUM(qty),0) q,"
+                      f" COALESCE(SUM(confirmed_qty),0) cq FROM {items_table}"
+                      f" WHERE order_id=?", (oid,)).fetchone()
+        if r["cq"] + 1e-9 >= r["q"]:
+            return err("该单已全部确认，不能废单", 400)
+        if r["cq"] <= 0:
+            c.execute(f"UPDATE {table} SET voided=1, voided_at=?, status='voided'"
+                      " WHERE id=?", (now, oid))
+            action = "废进货" if kind == "inbound" else "废出货"
+            audit(c, u["username"], action, o["order_no"], "未确认过，整单废")
+            return {"ok": True, "order_no": o["order_no"], "status": "voided"}
+        c.execute(f"UPDATE {table} SET status='closed' WHERE id=?", (oid,))
+        action = "废进货剩余" if kind == "inbound" else "废出货剩余"
+        audit(c, u["username"], action, o["order_no"],
+              f"已确认 {int(r['cq'])} 瓶保留，剩余取消")
+        return {"ok": True, "order_no": o["order_no"], "status": "closed"}
 
 
 @app.get("/api/stock")
@@ -1104,6 +1568,8 @@ async def share_png(otype: str, oid: int, request: Request):
             d = order_detail(c, "outbound_orders", "outbound_items", oid)
             if not d:
                 return err("单据不存在", 404)
+            if d.get("voided"):
+                return err("已作废的单据不能生成分享图", 400)
             if (d.get("type") or "sale") != "sale":
                 return err("自饮/赠送/破损单不需要分享图", 400)
             cust = c.execute("SELECT name FROM customers WHERE id=?",
@@ -1135,6 +1601,8 @@ async def share_png(otype: str, oid: int, request: Request):
             d = order_detail(c, "inbound_orders", "inbound_items", oid)
             if not d:
                 return err("单据不存在", 404)
+            if d.get("voided"):
+                return err("已作废的单据不能生成分享图", 400)
             sup = c.execute("SELECT name FROM suppliers WHERE id=?",
                             (d["supplier_id"],)).fetchone()
             kind = "补登单" if d["type"] == "opening" else "进货单"
