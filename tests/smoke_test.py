@@ -74,11 +74,11 @@ def main():
         s, _ = req("GET", "/api/wines")
         check("未登录调业务接口返回 401", s == 401, f"status={s}")
 
-        # 1b. 版本接口公开返回 v2.10.0（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
+        # 1b. 版本接口公开返回 v2.11.0（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
         s, d = req("GET", "/api/version")
-        check("版本接口 /api/version 返回 v2.10.0", s == 200 and d.get("version") == "v2.10.0", f"status={s} {d}")
+        check("版本接口 /api/version 返回 v2.11.0", s == 200 and d.get("version") == "v2.11.0", f"status={s} {d}")
         s, d = req("GET", "/api/config")
-        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.10.0" and "build_date" in d, f"status={s} {d}")
+        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.11.0" and "build_date" in d, f"status={s} {d}")
 
         # 2. 无默认用户: 首位注册前注册开放, 默认账号登录失败
         s, d = req("GET", "/api/auth/status")
@@ -742,8 +742,8 @@ def main():
               f"nav={nav_labels}")
         admin = _re.search(r'id="page-admin"(.*?)</div></div>', html, _re.S).group(1)
         admin_labels = _re.findall(r'>([^<]+)</button>', admin)
-        check("管理页有八个二级入口: 酒库/补登/供应商/客户/仓库/操作记录/用户管理/改密码",
-              admin_labels == ["酒库", "补登", "供应商", "客户", "仓库", "操作记录", "用户管理", "改密码"],
+        check("管理页有九个二级入口: 酒库/补登/供应商/客户/仓库/操作记录/用户管理/系统备份/改密码",
+              admin_labels == ["酒库", "补登", "供应商", "客户", "仓库", "操作记录", "用户管理", "系统备份", "改密码"],
               f"admin={admin_labels}")
         check("基础资料页已无入口",
               'page-master' not in html and '基础资料' not in html
@@ -1931,35 +1931,92 @@ def main():
         check("自饮建单时库存不足被拒 400", s == 400 and "缺" in str(d),
               f"status={s} {d}")
 
-        # 27e. 备份与恢复 (对正在跑的测试库做在线备份再恢复, 行数对照)
+        # 28. v2.11.0: 应用内备份与恢复 (照 fund 的做法, 不用命令行)
+        import gzip as _gzip
         import sqlite3 as _sqlite3
         bdir = os.path.join(tmp, "backups")
-        env_b = dict(os.environ, VIN_ROUGE_DB=os.path.join(tmp, "test.db"),
-                     VIN_ROUGE_BACKUP_DIR=bdir, PATH=os.environ["PATH"])
-        r = subprocess.run(["/bin/sh", str(BASE / "scripts" / "backup.sh")],
-                           capture_output=True, text=True, env=env_b)
-        check("backup.sh 跑成功", r.returncode == 0,
-              f"rc={r.returncode} out={r.stdout.strip()} err={r.stderr.strip()}")
-        daily = sorted(Path(bdir, "daily").glob("vin_rouge-*.db")) \
-            if Path(bdir, "daily").exists() else []
-        check("备份文件已生成", len(daily) == 1, f"files={daily}")
-        bak = str(daily[0]) if daily else ""
-        rdir = os.path.join(tmp, "restored")
-        r = subprocess.run(["/bin/sh", str(BASE / "scripts" / "restore.sh"),
-                            bak, rdir], capture_output=True, text=True)
-        check("restore.sh 跑成功", r.returncode == 0 and "恢复完成" in r.stdout,
-              f"rc={r.returncode} out={r.stdout.strip()} err={r.stderr.strip()}")
-        tables = ["users", "wines", "stock", "inbound_orders",
-                  "outbound_orders", "return_orders", "payments"]
-        _okc = True
-        for _t in tables:
-            _a = _sqlite3.connect(os.path.join(tmp, "test.db")).execute(
-                f"SELECT COUNT(*) FROM {_t}").fetchone()[0]
-            _b = _sqlite3.connect(os.path.join(rdir, "vin_rouge.db")).execute(
-                f"SELECT COUNT(*) FROM {_t}").fetchone()[0]
-            if _a != _b:
-                _okc = False
-        check("恢复后的库行数与原库一致", _okc, f"tables={tables}")
+        # 28a. 手动备份接口生成 .db.gz 和边车文件, 列表接口返回备份
+        s, d = req("POST", "/api/backups", {}, token=tok)
+        check("手动备份接口成功", s == 200 and d.get("ok") is True
+              and d.get("backup", {}).get("name", "").endswith(".db.gz"),
+              f"status={s} {d}")
+        bname = d.get("backup", {}).get("name", "")
+        check("备份文件 .db.gz 已生成",
+              bool(bname) and Path(bdir, bname).is_file(), f"name={bname}")
+        check("边车 .json 已生成",
+              bool(bname) and Path(bdir, bname[:-6] + ".json").is_file(),
+              f"name={bname}")
+        s, d = req("GET", "/api/backups", token=tok)
+        names = [b["name"] for b in d.get("backups", [])]
+        check("备份列表接口返回备份",
+              s == 200 and bname in names, f"status={s} names={names}")
+        # 28b. 保留 10 份: 造 12 份旧备份再备一份, 只剩 10 份
+        for i in range(1, 13):
+            Path(bdir, f"vin-backup-202601{i:02d}-000001.db.gz").write_bytes(b"old")
+        s, d = req("POST", "/api/backups", {}, token=tok)
+        s, d = req("GET", "/api/backups", token=tok)
+        names = [b["name"] for b in d.get("backups", [])]
+        check("保留 10 份 (12 份旧备份 + 新备一份后只剩 10 份)",
+              s == 200 and len(names) == 10, f"count={len(names)}")
+        # 28c. 下载接口能拿到文件 (gzip 魔数)
+        dl_name = names[0]
+        _r = urllib.request.Request(
+            ROOT + "/api/backups/" + dl_name + "/download")
+        _r.add_header("Authorization", f"Bearer {tok}")
+        with urllib.request.urlopen(_r, timeout=10) as _resp:
+            _raw = _resp.read()
+        check("下载接口能拿到文件 (gzip 格式)",
+              _raw[:2] == b"\x1f\x8b" and len(_raw) > 100,
+              f"len={len(_raw)} head={_raw[:2]}")
+        # 28d. 恢复全流程: 备份 -> 改数据 -> 恢复 -> 数据回来, 恢复前自动备 pre-restore
+        s, w2 = req("POST", "/api/wines",
+                    {"barcode": "6909999999999", "name": "备份测试酒"},
+                    token=tok)
+        wid2 = w2.get("id")
+        check("建恢复测试用酒", s == 200 and wid2, f"status={s} {w2}")
+        s, d = req("POST", "/api/backups", {}, token=tok)
+        rb_name = d.get("backup", {}).get("name", "")
+        check("恢复前先备份一次", s == 200 and bool(rb_name), f"status={s} {d}")
+        s, d = req("PUT", f"/api/wines/{wid2}", {"name": "改名后的酒"},
+                   token=tok)
+        check("改名 (恢复后应被还原)", s == 200, f"status={s} {d}")
+        s, d = req("POST", f"/api/backups/{rb_name}/restore", {},
+                   token=tok)
+        check("恢复接口成功", s == 200 and d.get("ok") is True,
+              f"status={s} {d}")
+        s, ws = req("GET", "/api/wines", token=tok)
+        w2_after = [w for w in ws if w["id"] == wid2]
+        check("恢复后数据回来 (酒名还原)",
+              s == 200 and len(w2_after) == 1
+              and w2_after[0]["name"] == "备份测试酒",
+              f"status={s} wine={w2_after}")
+        s, d = req("GET", "/api/backups", token=tok)
+        kinds = [b["kind"] for b in d.get("backups", [])]
+        check("恢复前自动备了一份 pre-restore",
+              "pre-restore" in kinds, f"kinds={kinds}")
+        # 28e. 非法备份名被拒绝
+        s, d = req("GET", "/api/backups/not-a-backup.db/download", token=tok)
+        check("非法备份名 (格式不对) 下载被拒 400", s == 400, f"status={s} {d}")
+        s, d = req("GET", "/api/backups/..%2Fevil.db.gz/download", token=tok)
+        check("非法备份名 (带 ../) 下载被拒 (路由层或接口层拦住)",
+              s in (400, 404), f"status={s} {d}")
+        s, d = req("POST", "/api/backups/not-a-backup.db/restore", {},
+                   token=tok)
+        check("非法备份名恢复被拒 400", s == 400, f"status={s} {d}")
+        s, d = req("GET", "/api/backups/vin-backup-20260101-000001.db.gz/download",
+                   token=tok)
+        check("不存在的备份下载 404", s == 404, f"status={s} {d}")
+        # 28f. 前端: 管理页面系统备份区块在场
+        s, html = req("GET", "/")
+        check("管理页面有系统备份入口和备份页",
+              'id="page-backup"' in html and "系统备份" in html
+              and 'id="backup-now-btn"' in html and 'id="backup-list"' in html,
+              f"status={s}")
+        check("备份页有自动备份说明与下载恢复入口",
+              "每天 1 时自动备份" in html and "恢复前会自动备份当前数据" in html
+              and "downloadBackup" in html and "restoreBackup" in html,
+              f"status={s}")
+
 
         # 27f. 前端: 退货页/退货卡片/付款撤销/多付显示在场
         s, html = req("GET", "/")

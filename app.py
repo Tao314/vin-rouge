@@ -1,16 +1,27 @@
 """vin-rouge v2: 酒类分销进销存 (FastAPI + SQLite, 单文件)."""
+import asyncio
+import gzip
 import hashlib
 import json
 import os
 import re
 import secrets
-import subprocess
+import shutil
 import sqlite3
+import subprocess
+import threading
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta, date
 from io import BytesIO
 from pathlib import Path
+
+try:
+    from zoneinfo import ZoneInfo
+    CN_TZ = ZoneInfo("Asia/Shanghai")
+except Exception:
+    from datetime import timezone as _tz
+    CN_TZ = _tz(timedelta(hours=8))
 
 from fastapi import FastAPI, Request, UploadFile, File, Form
 from fastapi.responses import JSONResponse, FileResponse, Response
@@ -27,8 +38,8 @@ TOKEN_TTL_HOURS = 24
 # ---------- 版本（单点管理） ----------
 # 唯一版本源：只改 APP_VERSION，全仓同步
 # （前端页脚、README、/api/version、/api/config 都以它为准，不要在别处手写版本号）。
-APP_VERSION = "v2.10.0"
-BUILD_DATE = "2026-11-25"
+APP_VERSION = "v2.11.0"
+BUILD_DATE = "2026-11-26"
 
 
 def _git_commit():
@@ -298,8 +309,9 @@ def err(msg, code=400):
 
 
 @app.on_event("startup")
-def startup():
+async def startup():
     init_db()
+    asyncio.create_task(_backup_loop())
 
 
 @app.get("/")
@@ -2130,6 +2142,238 @@ async def list_stock(request: Request):
                        " FROM stock s JOIN wines w ON w.id=s.wine_id"
                        " JOIN warehouses wh ON wh.id=s.warehouse_id"
                        " WHERE s.quantity>0 ORDER BY w.name")
+
+# ---------- 系统备份与恢复 (v2.11.0, 照 fund v1.4.0 的做法) ----------
+# 应用内备份: 后台循环每天 1 时自动备份, 管理页面可手动备份/下载/恢复,
+# 不用 systemd 定时任务、不走命令行. 备份是 sqlite3 backup API 生成的
+# 一致性副本 (WAL 安全), gzip 压成 .db.gz, 带 .json 边车文件.
+# 恢复: 先校验备份、自动备一份当前数据 (pre-restore), 再用 backup API
+# 把备份拷进正在用的数据库 (不换文件, WAL 不乱), 最后重跑 init_db()
+# 让旧备份在新代码下也能用. 保留最新的 BACKUP_KEEP 份.
+BACKUP_DIR = DB_PATH.parent / "backups"
+BACKUP_KEEP = 10
+BACKUP_NAME_RE = re.compile(r"^vin-backup-\d{8}-\d{6}\.db\.gz$")
+_backup_lock = threading.RLock()
+
+
+def _backup_sidecar(path: Path) -> Path:
+    """Sidecar .json for a backup file: 同名, 去掉 .db.gz 后缀加 .json."""
+    name = path.name
+    if name.endswith(".gz"):
+        name = name[:-3]
+    if name.endswith(".db"):
+        name = name[:-3]
+    return path.with_name(name + ".json")
+
+
+def _backup_stamp_str(path: Path) -> str:
+    name = path.name
+    if name.endswith(".gz"):
+        name = name[:-3]
+    if name.endswith(".db"):
+        name = name[:-3]
+    return name
+
+
+def _backup_entry(path: Path) -> dict:
+    meta = {}
+    sidecar = _backup_sidecar(path)
+    if sidecar.is_file():
+        try:
+            meta = json.loads(sidecar.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+    if not meta.get("created_at"):
+        try:
+            dt = datetime.strptime(_backup_stamp_str(path),
+                                   "vin-backup-%Y%m%d-%H%M%S").replace(tzinfo=CN_TZ)
+            meta["created_at"] = dt.isoformat()
+        except ValueError:
+            meta["created_at"] = datetime.fromtimestamp(
+                path.stat().st_mtime, CN_TZ).isoformat()
+    return {
+        "name": path.name,
+        "created_at": meta.get("created_at", ""),
+        "kind": meta.get("kind") or "manual",
+        "size_bytes": path.stat().st_size,
+        "app_version": meta.get("app_version") or "",
+        "compressed": path.name.endswith(".gz"),
+    }
+
+
+def _list_backups() -> list:
+    if not BACKUP_DIR.is_dir():
+        return []
+    paths = [p for p in BACKUP_DIR.glob("*.db.gz")
+             if BACKUP_NAME_RE.fullmatch(p.name)]
+    return [_backup_entry(p) for p in sorted(paths, key=lambda p: p.name,
+                                             reverse=True)]
+
+
+def _prune_backups():
+    entries = _list_backups()
+    for e in entries[BACKUP_KEEP:]:
+        p = BACKUP_DIR / e["name"]
+        p.unlink(missing_ok=True)
+        _backup_sidecar(p).unlink(missing_ok=True)
+
+
+def _make_backup(kind: str) -> dict:
+    with _backup_lock:
+        BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        created = datetime.now(CN_TZ)
+        stamp = created
+        while True:  # 同一秒内重复备份, 文件名秒数 +1
+            name = f"vin-backup-{stamp:%Y%m%d-%H%M%S}.db.gz"
+            dest = BACKUP_DIR / name
+            if not dest.exists():
+                break
+            stamp += timedelta(seconds=1)
+        raw = BACKUP_DIR / (name + ".rawtmp")
+        try:
+            src = sqlite3.connect(str(DB_PATH))
+            try:
+                src.execute("PRAGMA busy_timeout=10000")
+                dst = sqlite3.connect(str(raw))
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
+            finally:
+                src.close()
+            with open(raw, "rb") as fin, gzip.open(dest, "wb") as fout:
+                shutil.copyfileobj(fin, fout)
+        finally:
+            raw.unlink(missing_ok=True)
+        meta = {"created_at": created.isoformat(), "app_version": APP_VERSION,
+                "kind": kind, "size_bytes": dest.stat().st_size,
+                "compressed": True}
+        _backup_sidecar(dest).write_text(
+            json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        _prune_backups()
+        return {"name": name, **meta}
+
+
+def _restore_backup(name: str) -> dict:
+    """校验 + 恢复指定备份进正在用的数据库, 返回恢复前自动备的那份.
+    备份文件不合法时抛 ValueError."""
+    with _backup_lock:
+        path = BACKUP_DIR / name
+        # 先把目标备份解压到临时文件 (也防 _make_backup 的清理删掉它).
+        tmp = BACKUP_DIR / (name + ".restore-tmp")
+        try:
+            try:
+                with gzip.open(path, "rb") as fin, open(tmp, "wb") as fout:
+                    shutil.copyfileobj(fin, fout)
+            except (OSError, EOFError):
+                raise ValueError("备份文件解压失败, 不是有效的 gzip 备份")
+            try:
+                c = sqlite3.connect(tmp.as_uri() + "?mode=ro", uri=True)
+                try:
+                    ok = c.execute("PRAGMA integrity_check").fetchone()[0]
+                    tables = {r[0] for r in c.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table'")}
+                finally:
+                    c.close()
+            except sqlite3.Error:
+                raise ValueError("备份文件不是有效的 SQLite 数据库")
+            if ok != "ok":
+                raise ValueError("备份文件完整性校验失败")
+            if not {"users", "wines"} <= tables:
+                raise ValueError("备份文件缺少核心表, 不是有效的系统备份")
+            pre = _make_backup("pre-restore")
+            src = sqlite3.connect(str(tmp))
+            try:
+                dst = sqlite3.connect(str(DB_PATH))
+                try:
+                    dst.execute("PRAGMA busy_timeout=10000")
+                    src.backup(dst)
+                finally:
+                    dst.close()
+            finally:
+                src.close()
+        finally:
+            tmp.unlink(missing_ok=True)
+        init_db()  # 重跑迁移, 让旧备份在新代码下也能用
+        return pre
+
+
+async def _backup_loop():
+    """每天 1 时 (Asia/Shanghai) 自动备份; 启动时一个备份都没有就先备一份."""
+    await asyncio.sleep(10)
+    try:
+        if not await asyncio.to_thread(_list_backups):
+            await asyncio.to_thread(_make_backup, "auto")
+    except Exception as e:
+        print(f"[backup] initial backup failed: {e!r}", flush=True)
+    while True:
+        now = datetime.now(CN_TZ)
+        nxt = (now + timedelta(days=1)).replace(hour=1, minute=0, second=0,
+                                                microsecond=0)
+        await asyncio.sleep(max(1.0, (nxt - now).total_seconds()))
+        try:
+            await asyncio.to_thread(_make_backup, "auto")
+        except Exception as e:
+            print(f"[backup] daily backup failed: {e!r}", flush=True)
+
+
+@app.get("/api/backups")
+async def list_backups(request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    return {"backups": await asyncio.to_thread(_list_backups)}
+
+
+@app.post("/api/backups")
+async def create_backup(request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    try:
+        entry = await asyncio.to_thread(_make_backup, "manual")
+    except Exception as ex:
+        return err(f"备份失败: {ex}", 500)
+    with conn() as c:
+        audit(c, u["username"], "手动备份", entry["name"], "")
+    return {"ok": True, "backup": entry}
+
+
+@app.get("/api/backups/{name}/download")
+async def download_backup(name: str, request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    if not BACKUP_NAME_RE.fullmatch(name):
+        return err("备份文件名不合法", 400)
+    path = BACKUP_DIR / name
+    if not path.is_file():
+        return err("备份不存在", 404)
+    return FileResponse(path, filename=name,
+                        media_type="application/octet-stream")
+
+
+@app.post("/api/backups/{name}/restore")
+async def restore_backup(name: str, request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    if not BACKUP_NAME_RE.fullmatch(name):
+        return err("备份文件名不合法", 400)
+    if not (BACKUP_DIR / name).is_file():
+        return err("备份不存在", 404)
+    try:
+        pre = await asyncio.to_thread(_restore_backup, name)
+    except ValueError as ex:
+        return err(str(ex), 400)
+    except Exception as ex:
+        return err(f"恢复失败: {ex}", 500)
+    with conn() as c:
+        audit(c, u["username"], "恢复备份", name,
+              f"恢复前已备份 {pre['name']}")
+    return {"ok": True, "restored": name, "pre_restore_backup": pre["name"],
+            "note": "已恢复; 如当前会话不在恢复后的数据库中请重新登录"}
+
 
 # ---------- 分享图 ----------
 def render_share_png(lines, title):
