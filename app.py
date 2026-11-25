@@ -26,7 +26,7 @@ TOKEN_TTL_HOURS = 24
 # ---------- 版本（单点管理） ----------
 # 唯一版本源：只改 APP_VERSION，全仓同步
 # （前端页脚、README、/api/version、/api/config 都以它为准，不要在别处手写版本号）。
-APP_VERSION = "v2.5.2"
+APP_VERSION = "v2.6.0"
 BUILD_DATE = "2026-11-25"
 
 
@@ -64,6 +64,7 @@ def init_db():
           id INTEGER PRIMARY KEY AUTOINCREMENT, barcode TEXT UNIQUE, name TEXT NOT NULL,
           brand TEXT, spec TEXT, capacity_ml INTEGER, abv REAL, origin TEXT,
           manufacturer TEXT, image_path TEXT, description TEXT,
+          sale_price REAL,
           created_at TEXT, updated_at TEXT);
         CREATE TABLE IF NOT EXISTS warehouses(
           id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, active INTEGER DEFAULT 1);
@@ -139,6 +140,7 @@ def init_db():
                 ("outbound_items", "discount_amount", "REAL DEFAULT 0"),
                 ("outbound_items", "cost_price", "REAL DEFAULT 0"),
                 ("outbound_items", "reason", "TEXT"),
+                ("wines", "sale_price", "REAL"),
                 ("inbound_orders", "status", "TEXT DEFAULT 'pending'"),
                 ("inbound_items", "confirmed_qty", "INTEGER DEFAULT 0"),
                 ("outbound_orders", "status", "TEXT DEFAULT 'pending'"),
@@ -416,14 +418,16 @@ async def create_wine(request: Request):
     now = datetime.now().isoformat()
     with conn() as c:
         try:
+            sp = b.get("sale_price")
+            sp = float(sp) if sp not in (None, "") else None
             cur = c.execute(
                 "INSERT INTO wines(barcode,name,brand,spec,capacity_ml,abv,origin,"
-                "manufacturer,description,created_at,updated_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "manufacturer,description,sale_price,created_at,updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (b.get("barcode") or None, b["name"], b.get("brand"),
                  b.get("spec"), b.get("capacity_ml"), b.get("abv"),
                  b.get("origin"), b.get("manufacturer"),
-                 b.get("description"), now, now))
+                 b.get("description"), sp, now, now))
         except sqlite3.IntegrityError:
             return err("条码已存在")
         audit(c, u["username"], "新增酒", b["name"], "")
@@ -437,7 +441,7 @@ async def update_wine(wid: int, request: Request):
         return e
     b = await request.json()
     fields = ["barcode", "name", "brand", "spec", "capacity_ml", "abv", "origin",
-              "manufacturer", "description"]
+              "manufacturer", "description", "sale_price"]
     with conn() as c:
         sets = ", ".join(f"{f}=?" for f in fields if f in b)
         if not sets:
@@ -1009,9 +1013,8 @@ async def list_inbound(request: Request, type: str = "", supplier_id: str = "",
         q += " AND order_date<=?"; args.append(date_to)
     with conn() as c:
         ds = rows(c, q + " ORDER BY id DESC", args)
-        for d in ds:
-            d["paid_amount"] = paid_total(c, "inbound", d["id"])
-        return ds
+        return [order_detail(c, "inbound_orders", "inbound_items", d["id"])
+                for d in ds]
 
 
 @app.get("/api/inbound/{oid}")
@@ -1173,9 +1176,8 @@ async def list_outbound(request: Request, customer_id: str = "",
         q += " AND order_date<=?"; args.append(date_to)
     with conn() as c:
         ds = rows(c, q + " ORDER BY id DESC", args)
-        for d in ds:
-            d["paid_amount"] = paid_total(c, "outbound", d["id"])
-        return ds
+        return [order_detail(c, "outbound_orders", "outbound_items", d["id"])
+                for d in ds]
 
 
 @app.get("/api/outbound/{oid}")

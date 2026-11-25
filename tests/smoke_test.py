@@ -75,9 +75,9 @@ def main():
 
         # 1b. 版本接口公开返回 v2.5.2（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
         s, d = req("GET", "/api/version")
-        check("版本接口 /api/version 返回 v2.5.2", s == 200 and d.get("version") == "v2.5.2", f"status={s} {d}")
+        check("版本接口 /api/version 返回 v2.6.0", s == 200 and d.get("version") == "v2.6.0", f"status={s} {d}")
         s, d = req("GET", "/api/config")
-        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.5.2" and "build_date" in d, f"status={s} {d}")
+        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.6.0" and "build_date" in d, f"status={s} {d}")
 
         # 2. 无默认用户: 首位注册前注册开放, 默认账号登录失败
         s, d = req("GET", "/api/auth/status")
@@ -252,7 +252,7 @@ def main():
         s, _html = req("GET", "/")
         check("调拨单详情前端有调出调入仓库名拼接",
               "from_warehouse_name" in _html and "to_warehouse_name" in _html
-              and "from_warehouse_name||''} → ${tr.to_warehouse_name" in _html,
+              and "from_warehouse_name||''} → ${o.to_warehouse_name" in _html,
               f"status={s}")
         s, d = req("POST", f"/api/transfers/{tr_id}/confirm", {}, token=tok)
         check("确认调拨后状态为已完成",
@@ -735,8 +735,8 @@ def main():
               f"nav={nav_labels}")
         admin = _re.search(r'id="page-admin"(.*?)</div></div>', html, _re.S).group(1)
         admin_labels = _re.findall(r'>([^<]+)</button>', admin)
-        check("管理页有七个二级入口: 酒库/补登/供应商/客户/仓库/操作记录/用户管理",
-              admin_labels == ["酒库", "补登", "供应商", "客户", "仓库", "操作记录", "用户管理"],
+        check("管理页有八个二级入口: 酒库/补登/供应商/客户/仓库/操作记录/用户管理/改密码",
+              admin_labels == ["酒库", "补登", "供应商", "客户", "仓库", "操作记录", "用户管理", "改密码"],
               f"admin={admin_labels}")
         check("基础资料页已无入口",
               'page-master' not in html and '基础资料' not in html
@@ -765,7 +765,7 @@ def main():
         btn_classes = sorted(set(_re.findall(r'<button[^>]*class="([^"]*)"', html)))
         check("全站按钮 class 只有统一的几种, 无孤立样式",
               set(btn_classes) <= {"ghost", "ghost hidden", "hidden", "btn-block",
-                                   "ghost btn-block"},
+                                   "ghost btn-block", "ghost btn-block hidden"},
               f"classes={btn_classes}")
         check("表单主按钮统一全宽, 保存+取消成对等宽",
               html.count('class="btn-block"') >= 7
@@ -911,6 +911,131 @@ def main():
         check("副仓清空后可删除", s == 200, f"status={s}")
         s, d = req("DELETE", f"/api/warehouses/{wh1}", None, token=tok)
         check("删除最后一个仓库被拒 400", s == 400, f"status={s} {d}")
+
+        # 23. v2.6.0: 改密码入口、酒售价+按行折扣、表单不超宽、单据页改版
+        # 23a. 酒的默认售价: 建酒可填售价, 列表带回, 修改生效, 不填则为空
+        s, w = req("POST", "/api/wines",
+                   {"barcode": "6901234567893", "name": "测试售价酒",
+                    "brand": "测试牌", "spec": "750ml", "sale_price": 268}, token=tok)
+        wid_sp = w.get("id")
+        check("建酒可填默认售价 268", s == 200 and wid_sp, f"status={s} {w}")
+        s, ws = req("GET", "/api/wines", token=tok)
+        row = [x for x in ws if x["id"] == wid_sp][0]
+        check("酒列表带回售价 268", row.get("sale_price") == 268, f"status={s} {row}")
+        s, _ = req("PUT", f"/api/wines/{wid_sp}", {"sale_price": 288}, token=tok)
+        s, ws = req("GET", "/api/wines", token=tok)
+        row = [x for x in ws if x["id"] == wid_sp][0]
+        check("酒售价可修改为 288", s == 200 and row.get("sale_price") == 288,
+              f"status={s} {row}")
+        s, w = req("POST", "/api/wines",
+                   {"barcode": "6901234567894", "name": "测试无售价酒",
+                    "brand": "测试牌", "spec": "750ml"}, token=tok)
+        wid_nosp = w.get("id")
+        s, ws = req("GET", "/api/wines", token=tok)
+        row = [x for x in ws if x["id"] == wid_nosp][0]
+        check("不填售价的酒 sale_price 为空", row.get("sale_price") is None,
+              f"status={s} {row}")
+
+        # 23b. 按行折扣: 三行各不同折扣, 汇总按行算
+        s, d = req("POST", "/api/inbound",
+                   {"type": "opening", "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_sp, "qty": 5, "unit_price": 120},
+                              {"wine_id": wid_nosp, "qty": 5, "unit_price": 60}]},
+                   token=tok)
+        check("折扣测试酒各补登 5 瓶", s == 200, f"status={s} {d}")
+        s, d = req("POST", "/api/outbound",
+                   {"type": "sale", "customer_id": cus, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_sp, "qty": 2, "orig_price": 288,
+                               "discount_rate": 0.9, "reason": "瓶身划痕"},
+                              {"wine_id": wid_nosp, "qty": 3, "orig_price": 100,
+                               "discount_price": 80, "reason": "临期处理"},
+                              {"wine_id": wid, "qty": 1, "orig_price": 150}]},
+                   token=tok)
+        disc3_id = d.get("id")
+        check("三行不同折扣: 原价 1026/实收 908.4/折扣 117.6",
+              s == 200 and d.get("orig_total") == 1026
+              and d.get("sale_total") == 908.4 and d.get("discount_total") == 117.6,
+              f"status={s} {d}")
+        s, d = req("GET", f"/api/outbound/{disc3_id}", token=tok)
+        its = {i["wine_id"]: i for i in d["items"]}
+        check("每行折扣额和原因都按行存",
+              its[wid_sp]["discount_amount"] == 57.6
+              and its[wid_sp]["reason"] == "瓶身划痕"
+              and its[wid_nosp]["discount_amount"] == 60
+              and its[wid_nosp]["reason"] == "临期处理"
+              and its[wid]["discount_amount"] == 0, f"status={s} {d}")
+        s, d = req("POST", "/api/outbound",
+                   {"type": "sale", "customer_id": cus, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_sp, "qty": 1, "orig_price": 288,
+                               "discount_price": 200}]}, token=tok)
+        check("折后价打折无原因被拒", s == 400, f"status={s} {d}")
+        s, d = req("POST", f"/api/outbound/{disc3_id}/confirm", {}, token=tok)
+        check("确认三行折扣单后已出货",
+              s == 200 and d.get("status") == "shipped", f"status={s} {d}")
+        s, d = req("GET", f"/api/orders/outbound/{disc3_id}/share.png", token=tok)
+        check("按行折扣单分享图仍为有效 PNG", s == 200 and d[:8] == b"\x89PNG\r\n\x1a\n",
+              f"status={s}")
+
+        # 23c. 改密码入口: 旧密码错被拒, 改对后能登录 (主管理员测, 改完改回;
+        # 注: admin2 在前面已被停用, 其 token 已失效, 不能用它测)
+        s, d = req("POST", "/api/change-password",
+                   {"old_password": "WrongPass", "new_password": "TempPass123"},
+                   token=tok)
+        check("原密码错误改密被拒", s == 400, f"status={s} {d}")
+        s, d = req("POST", "/api/change-password",
+                   {"old_password": "NewPass123", "new_password": "TempPass123"},
+                   token=tok)
+        check("管理员改密成功", s == 200, f"status={s} {d}")
+        s, d2x = req("POST", "/api/login",
+                     {"username": "tristan", "password": "TempPass123"})
+        check("改密后新密码能登录", s == 200 and "token" in d2x, f"status={s}")
+        s, d = req("POST", "/api/change-password",
+                   {"old_password": "TempPass123", "new_password": "NewPass123"},
+                   token=d2x.get("token", ""))
+        check("改密后改回原密码", s == 200, f"status={s} {d}")
+        # 登录会发新 token, 旧 tok 已失效, 重新登录拿新 token 供后面用
+        s, d = req("POST", "/api/login",
+                   {"username": "tristan", "password": "NewPass123"})
+        tok = d.get("token", "")
+        check("改回后重新登录拿新 token", s == 200 and bool(tok), f"status={s}")
+
+        # 23d. 单据列表接口返回明细 (卡片直接渲染用)
+        s, ds = req("GET", "/api/outbound", token=tok)
+        row = [x for x in ds if x["id"] == disc3_id][0]
+        check("出货列表带明细 items (3 行)",
+              "items" in row and len(row["items"]) == 3
+              and row["items"][0].get("wine_name"), f"status={s}")
+        s, ds = req("GET", "/api/inbound", token=tok)
+        row = [x for x in ds if x["id"] == opening_id][0]
+        check("进货列表带明细 items",
+              "items" in row and len(row["items"]) >= 1
+              and row["items"][0].get("wine_name"), f"status={s}")
+
+        # 23e. 前端 v2.6.0: 改密码入口、售价输入、按行折扣、表单不超宽、单据页改版
+        s, html = req("GET", "/")
+        check("管理页有改密码入口, 改密卡片有取消返回",
+              "showChpw()" in html and 'id="chpw-cancel"' in html
+              and 'id="chpw-title"' in html, f"status={s}")
+        check("酒库表单有默认售价输入, 出货行有按行折扣输入",
+              'id="w-sale-price"' in html and 'outLineRate(' in html
+              and 'outLineDprice(' in html and 'outLineReason(' in html
+              and '折扣原因' in html, f"status={s}")
+        check("整单级折扣输入已去掉",
+              'id="out-rate"' not in html and 'id="out-reason"' not in html
+              and 'id="out-discount"' not in html, f"status={s}")
+        css = _re.search(r'<style>(.*?)</style>', html, _re.S).group(1)
+        check("表单输入框不超宽: max-width:100% 且 flex 子项可收缩",
+              'max-width:100%' in css
+              and '.line select{flex:2;min-width:0' in css
+              and '.line input{flex:1;min-width:0' in css, f"status={s}")
+        check("单据页无“单据”标题、无详情按钮、无详情页",
+              '<h2>单据</h2>' not in html and 'showOrder(' not in html
+              and 'showTransfer(' not in html and 'order-detail' not in html
+              and '详情' not in html, f"status={s}")
+        check("单据页直接渲染完整卡片, 付款状态显示中文",
+              'orderCard(' in html and 'order-card-' in html
+              and '已付清' in html and '部分付' in html and '未付' in html
+              and 'pay-amt' in html, f"status={s}")
 
         # 14. audit_logs 有记录
         s, logs = req("GET", "/api/audit-logs", token=tok)
