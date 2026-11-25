@@ -1,23 +1,5 @@
-# 数据与运行产物(绝不进仓库)
-data/
-*.db
-*.db-wal
-*.db-shm
-backups/
+vin_rouge.db
 uploads/
-INITIAL_PASSWORD.txt
-
-# 密钥与环境
-.env
-*.env
-*.pem
-*.key
-
-# Python
+.venv/
 __pycache__/
 *.pyc
-venv/
-.venv/
-
-# 系统
-.DS_Store
