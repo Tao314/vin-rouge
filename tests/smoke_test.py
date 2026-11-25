@@ -73,11 +73,11 @@ def main():
         s, _ = req("GET", "/api/wines")
         check("未登录调业务接口返回 401", s == 401, f"status={s}")
 
-        # 1b. 版本接口公开返回 v2.4.0（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
+        # 1b. 版本接口公开返回 v2.5.0（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
         s, d = req("GET", "/api/version")
-        check("版本接口 /api/version 返回 v2.4.0", s == 200 and d.get("version") == "v2.4.0", f"status={s} {d}")
+        check("版本接口 /api/version 返回 v2.5.0", s == 200 and d.get("version") == "v2.5.0", f"status={s} {d}")
         s, d = req("GET", "/api/config")
-        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.4.0" and "build_date" in d, f"status={s} {d}")
+        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.5.0" and "build_date" in d, f"status={s} {d}")
 
         # 2. 无默认用户: 首位注册前注册开放, 默认账号登录失败
         s, d = req("GET", "/api/auth/status")
@@ -243,6 +243,17 @@ def main():
               m.get((wh1, wid)) == 12 and m.get((wh2, wid), 0) == 0, str(m))
         s, ds = req("GET", "/api/transfers", token=tok)
         tr_id = [x for x in ds if x["transfer_no"] == d.get("transfer_no")][0]["id"]
+        s, ds = req("GET", "/api/transfers", token=tok)
+        _tr = [x for x in ds if x["id"] == tr_id][0]
+        check("调拨单返回调出/调入仓库名",
+              _tr.get("from_warehouse_name") and _tr.get("to_warehouse_name")
+              and _tr["from_warehouse_name"] != _tr["to_warehouse_name"],
+              f"{_tr}")
+        s, _html = req("GET", "/")
+        check("调拨单详情前端有调出调入仓库名拼接",
+              "from_warehouse_name" in _html and "to_warehouse_name" in _html
+              and "from_warehouse_name||''} → ${tr.to_warehouse_name" in _html,
+              f"status={s}")
         s, d = req("POST", f"/api/transfers/{tr_id}/confirm", {}, token=tok)
         check("确认调拨后状态为已完成",
               s == 200 and d.get("status") == "done", f"status={s} {d}")
@@ -711,10 +722,25 @@ def main():
               and '期初初始化' in html, f"status={s}")
         check("前端进货物流信息默认折叠",
               '<details id="in-logi">' in html, f"status={s}")
-        check("前端有基础资料/仓库/库存页与确认按钮",
-              'id="page-master"' in html and 'id="page-warehouses"' in html
+        check("前端有管理页/仓库/库存页与确认按钮",
+              'id="page-admin"' in html and 'id="page-warehouses"' in html
               and 'id="page-inventory"' in html and '确认到货' in html
               and '确认出货' in html and '确认调拨' in html, f"status={s}")
+        # 21k. v2.5.0: 导航简化 + 调拨单详情补全
+        import re as _re
+        nav = _re.search(r'<div class="nav">(.*?)</div>', html, _re.S).group(1)
+        nav_labels = _re.findall(r'>([^<]+)</button>', nav)
+        check("顶栏只留七个导航: 首页/进货/出货/调拨/库存/单据/管理",
+              nav_labels == ["首页", "进货", "出货", "调拨", "库存", "单据", "管理"],
+              f"nav={nav_labels}")
+        admin = _re.search(r'id="page-admin"(.*?)</div></div>', html, _re.S).group(1)
+        admin_labels = _re.findall(r'>([^<]+)</button>', admin)
+        check("管理页有七个二级入口: 酒库/补登/供应商/客户/仓库/操作记录/用户管理",
+              admin_labels == ["酒库", "补登", "供应商", "客户", "仓库", "操作记录", "用户管理"],
+              f"admin={admin_labels}")
+        check("基础资料页已无入口",
+              'page-master' not in html and '基础资料' not in html
+              and "show('master')" not in html, f"status={s}")
         check("前端按钮文字不变: 无“处理中”文字, 有下方加载提示条",
               '处理中' not in html and 'id="loading-bar"' in html
               and '加载中' in html, f"status={s}")

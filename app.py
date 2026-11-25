@@ -26,7 +26,7 @@ TOKEN_TTL_HOURS = 24
 # ---------- 版本（单点管理） ----------
 # 唯一版本源：只改 APP_VERSION，全仓同步
 # （前端页脚、README、/api/version、/api/config 都以它为准，不要在别处手写版本号）。
-APP_VERSION = "v2.4.0"
+APP_VERSION = "v2.5.0"
 BUILD_DATE = "2026-11-25"
 
 
@@ -1290,8 +1290,13 @@ async def list_transfers(request: Request):
     if e:
         return e
     with conn() as c:
-        return rows(c, "SELECT t.*, w.name AS wine_name FROM transfers t"
-                       " JOIN wines w ON w.id=t.wine_id ORDER BY t.id DESC")
+        return rows(c, "SELECT t.*, w.name AS wine_name,"
+                       " wf.name AS from_warehouse_name, wt.name AS to_warehouse_name"
+                       " FROM transfers t"
+                       " JOIN wines w ON w.id=t.wine_id"
+                       " LEFT JOIN warehouses wf ON wf.id=t.from_warehouse_id"
+                       " LEFT JOIN warehouses wt ON wt.id=t.to_warehouse_id"
+                       " ORDER BY t.id DESC")
 
 
 @app.post("/api/inbound/{oid}/confirm")
