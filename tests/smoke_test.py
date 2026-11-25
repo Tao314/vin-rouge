@@ -73,11 +73,11 @@ def main():
         s, _ = req("GET", "/api/wines")
         check("未登录调业务接口返回 401", s == 401, f"status={s}")
 
-        # 1b. 版本接口公开返回 v2.5.0（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
+        # 1b. 版本接口公开返回 v2.5.1（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
         s, d = req("GET", "/api/version")
-        check("版本接口 /api/version 返回 v2.5.0", s == 200 and d.get("version") == "v2.5.0", f"status={s} {d}")
+        check("版本接口 /api/version 返回 v2.5.1", s == 200 and d.get("version") == "v2.5.1", f"status={s} {d}")
         s, d = req("GET", "/api/config")
-        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.5.0" and "build_date" in d, f"status={s} {d}")
+        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.5.1" and "build_date" in d, f"status={s} {d}")
 
         # 2. 无默认用户: 首位注册前注册开放, 默认账号登录失败
         s, d = req("GET", "/api/auth/status")
@@ -744,6 +744,31 @@ def main():
         check("前端按钮文字不变: 无“处理中”文字, 有下方加载提示条",
               '处理中' not in html and 'id="loading-bar"' in html
               and '加载中' in html, f"status={s}")
+        # 21l. v2.5.1: 全站按钮样式统一
+        css = _re.search(r'<style>(.*?)</style>', html, _re.S).group(1)
+        nav_css = _re.search(r'\.nav\{([^}]*)\}', css).group(1)
+        nav_btn_rule = _re.search(r'\.nav button\{([^}]*)\}', css).group(1)
+        check("导航用 5 列等宽网格, 按钮不再 flex 拉宽",
+              'display:grid' in nav_css
+              and 'grid-template-columns:repeat(5,1fr)' in nav_css
+              and 'flex' not in nav_btn_rule, f"nav={nav_css} btn={nav_btn_rule}")
+        ghost_rule = _re.search(r'button\.ghost\{([^}]*)\}', css).group(1)
+        check("次要按钮统一白底酒红边框红字, 无灰底",
+              'background:#fff' in ghost_rule and 'color:#7b1e26' in ghost_rule
+              and 'border:1px solid #7b1e26' in ghost_rule
+              and '#F2F3F5' not in css, f"ghost={ghost_rule}")
+        check("按钮组都用等宽网格: 管理页 g5 / 单据筛选 g3 / 付款快捷 g3 / 补登原因 g2",
+              html.count('class="btn-grid g5"') == 1
+              and html.count('class="btn-grid g3"') == 3
+              and html.count('class="btn-grid g2"') == 1, f"status={s}")
+        btn_classes = sorted(set(_re.findall(r'<button[^>]*class="([^"]*)"', html)))
+        check("全站按钮 class 只有统一的几种, 无孤立样式",
+              set(btn_classes) <= {"ghost", "ghost hidden", "hidden", "btn-block",
+                                   "ghost btn-block"},
+              f"classes={btn_classes}")
+        check("表单主按钮统一全宽, 保存+取消成对等宽",
+              html.count('class="btn-block"') >= 7
+              and html.count('class="btn-pair"') == 3, f"status={s}")
 
         # 21j. 用户信息无 display_name
         s, us = req("GET", "/api/users", token=tok)
