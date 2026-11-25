@@ -73,30 +73,39 @@ def main():
         s, _ = req("GET", "/api/wines")
         check("未登录调业务接口返回 401", s == 401, f"status={s}")
 
-        # 1b. 版本接口公开返回 v2.0.0（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
+        # 1b. 版本接口公开返回 v2.1.0（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
         s, d = req("GET", "/api/version")
-        check("版本接口 /api/version 返回 v2.0.0", s == 200 and d.get("version") == "v2.0.0", f"status={s} {d}")
+        check("版本接口 /api/version 返回 v2.1.0", s == 200 and d.get("version") == "v2.1.0", f"status={s} {d}")
         s, d = req("GET", "/api/config")
-        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.0.0" and "build_date" in d, f"status={s} {d}")
+        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.1.0" and "build_date" in d, f"status={s} {d}")
 
-        # 2. tristan 默认密码登录, must_change_password 为真
-        s, d = req("POST", "/api/login", {"username": "tristan", "password": "vin123456"})
-        check("tristan 默认密码登录成功", s == 200 and "token" in d, f"status={s}")
-        check("首次登录 must_change_password 为真",
-              d.get("must_change_password") is True, str(d.get("must_change_password")))
+        # 2. 无默认用户: 首位注册前注册开放, 默认账号登录失败
+        s, d = req("GET", "/api/auth/status")
+        check("注册状态: 无用户时注册开放", s == 200 and d.get("registration_open") is True, f"status={s} {d}")
+        s, _ = req("POST", "/api/login", {"username": "tristan", "password": "vin123456"})
+        check("无默认用户: tristan/vin123456 登录失败", s == 401, f"status={s}")
+        s, _ = req("POST", "/api/register", {"username": "tristan", "password": "123"})
+        check("注册密码少于 6 位被拦", s == 400, f"status={s}")
+        s, d = req("POST", "/api/register", {"username": "tristan", "password": "FirstPass123"})
+        check("首位管理员注册成功", s == 200 and "token" in d, f"status={s} {d}")
+        check("首位管理员注册后无需强制改密",
+              d.get("must_change_password") is False, str(d.get("must_change_password")))
         tok = d.get("token", "")
-
-        # 2b. 未改密前业务接口被拦 (403)
-        s, _ = req("GET", "/api/wines", token=tok)
-        check("未改默认密码时业务接口被拦 403", s == 403, f"status={s}")
-
-        # 3. 改密后正常进业务页
-        s, d = req("POST", "/api/change-password",
-                   {"old_password": "vin123456", "new_password": "NewPass123"},
-                   token=tok)
-        check("改密成功", s == 200, f"status={s} {d}")
+        s, _ = req("POST", "/api/register", {"username": "someone", "password": "SomePass123"})
+        check("首位注册后再次注册被拦 403", s == 403, f"status={s}")
+        s, d = req("GET", "/api/auth/status")
+        check("注册状态: 有用户后注册关闭", s == 200 and d.get("registration_open") is False, f"status={s} {d}")
         s, d = req("GET", "/api/wines", token=tok)
-        check("改密后能进业务页", s == 200 and isinstance(d, list), f"status={s}")
+        check("首位管理员注册后能进业务页", s == 200 and isinstance(d, list), f"status={s}")
+
+        # 3. 首位管理员改密后仍能登录
+        s, d = req("POST", "/api/change-password",
+                   {"old_password": "FirstPass123", "new_password": "NewPass123"},
+                   token=tok)
+        check("首位管理员改密成功", s == 200, f"status={s} {d}")
+        s, d = req("POST", "/api/login", {"username": "tristan", "password": "NewPass123"})
+        check("改密后登录成功", s == 200 and "token" in d, f"status={s}")
+        tok = d.get("token", "")
 
         # 4. 新建第二个管理员, 用它登录, 能进货、能看到进价和利润 (不分角色)
         s, d = req("POST", "/api/users",
