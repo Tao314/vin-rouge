@@ -1,585 +1,189 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>红酒进销存 · 入库</title>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vin-rouge 酒类分销</title>
 <style>
-*{box-sizing:border-box}
-html,body{margin:0;padding:0;overflow-x:hidden}
-body{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f6f6f7;color:#1c1c1e;font-size:15px}
-.wrap{max-width:760px;margin:0 auto;padding:10px 12px 40px}
-header{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:6px 0 2px}
-h1{font-size:19px;margin:0;white-space:nowrap}
-.user{font-size:13px;color:#666;white-space:nowrap}
-.user b{color:#1458c8}
-nav{display:flex;gap:6px;flex-wrap:wrap;margin:10px 0}
-nav button{flex:1 1 auto;min-width:56px;padding:8px 4px;border:1px solid #d8d8dc;background:#fff;border-radius:9px;font-size:14px;cursor:pointer}
-nav button.on{background:#7a1f2b;color:#fff;border-color:#7a1f2b;font-weight:600}
-.subnav{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 10px}
-.subnav button{flex:1 1 auto;min-width:52px;padding:7px 4px;border:1px solid #d8d8dc;background:#fff;border-radius:9px;font-size:13px;cursor:pointer}
-.subnav button.on{background:#7a1f2b;color:#fff;border-color:#7a1f2b;font-weight:600}
-.card{background:#fff;border:1px solid #e4e4e8;border-radius:12px;padding:12px;margin:10px 0}
-.row{display:flex;justify-content:space-between;align-items:center;gap:8px}
-.small{font-size:12px;color:#777}
-.big{font-size:17px;font-weight:700}
-.btn{display:inline-block;padding:9px 14px;border:0;border-radius:9px;background:#7a1f2b;color:#fff;font-size:15px;cursor:pointer}
-.btn.sec{background:#fff;color:#333;border:1px solid #d8d8dc}
-.btn.sm{padding:5px 10px;font-size:13px}
-.btn:disabled{opacity:.55;cursor:default}
-input,select{width:100%;padding:9px;border:1px solid #d8d8dc;border-radius:9px;font-size:15px;background:#fff}
-label{display:block;font-size:13px;color:#555;margin:8px 0 4px}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
-@media(max-width:480px){.grid3{grid-template-columns:1fr 1fr}}
-.line{border-top:1px dashed #e0e0e4;margin-top:10px;padding-top:10px}
-.pill{display:inline-block;padding:1px 8px;border-radius:99px;background:#f3e5e8;color:#7a1f2b;font-size:12px}
-.pill.gray{background:#eee;color:#555}
-.loading{color:#888;padding:16px;text-align:center}
-.err{color:#b00020;font-size:13px;margin-top:6px;white-space:pre-wrap}
-.ok{color:#157347;font-size:13px;margin-top:6px}
-table{width:100%;border-collapse:collapse;font-size:13px}
-td,th{padding:6px 4px;border-bottom:1px solid #f0f0f2;text-align:left;vertical-align:top}
-.num{text-align:right;font-variant-numeric:tabular-nums}
-#login{position:fixed;inset:0;background:#f6f6f7;display:flex;align-items:flex-start;justify-content:center;padding-top:12vh;z-index:9}
-#login .card{width:min(92vw,340px)}
-footer{text-align:center;color:#999;font-size:12px;margin-top:18px}
-</style>
-</head>
-<body>
-<div id="login" style="display:none"><div class="card">
-  <div class="big">红酒进销存</div><div class="small" id="li-sub">请登录</div>
-  <label>账号</label><input id="li-user" autocomplete="username">
-  <label>密码</label><input id="li-pass" type="password" autocomplete="current-password">
-  <div style="margin-top:12px"><button class="btn" id="li-btn" style="width:100%">登录</button></div>
-  <div id="li-reg" style="display:none;margin-top:8px"><button class="btn sec" id="li-reg-btn" style="width:100%">注册新账号</button>
-  <div class="small" style="margin-top:6px">第一个注册的账号自动成为管理员</div></div>
-  <div class="err" id="li-err"></div>
-</div></div>
+*{box-sizing:border-box} body{margin:0;font-family:sans-serif;background:#f5f2ec;color:#222}
+header{background:#7b1e26;color:#fff;padding:14px 16px;font-size:22px;font-weight:bold;display:flex;justify-content:space-between;align-items:center}
+header button{background:#fff;color:#7b1e26;border:0;border-radius:8px;padding:8px 14px;font-size:16px}
+main{padding:14px;max-width:900px;margin:0 auto}
+.card{background:#fff;border-radius:12px;padding:16px;margin-bottom:14px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+h2{margin:0 0 12px;font-size:20px} h3{margin:14px 0 8px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.stat{background:#fff3e0;border-radius:12px;padding:16px;text-align:center}
+.stat b{display:block;font-size:28px;color:#7b1e26}
+.stat span{color:#666}
+.bigbtn{display:block;width:100%;padding:20px;font-size:22px;border:0;border-radius:12px;background:#7b1e26;color:#fff;margin-bottom:12px}
+button{padding:12px 18px;font-size:18px;border-radius:10px;border:0;background:#7b1e26;color:#fff;cursor:pointer}
+button.ghost{background:#eee;color:#222}
+input,select,textarea{width:100%;padding:12px;font-size:18px;border:1px solid #ccc;border-radius:10px;margin:6px 0}
+label{font-size:16px;color:#555}
+table{width:100%;border-collapse:collapse;font-size:16px}
+td,th{border-bottom:1px solid #eee;padding:8px 4px;text-align:left}
+.item{display:flex;gap:10px;align-items:center;border-bottom:1px solid #eee;padding:10px 0}
+.item img{width:64px;height:64px;object-fit:cover;border-radius:8px;background:#eee}
+.nav{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+.nav button{flex:1;min-width:80px;padding:12px 6px;font-size:16px}
+.hidden{display:none}
+.badge{display:inline-block;background:#e8f5e9;color:#2e7d32;border-radius:6px;padding:2px 8px;font-size:14px}
+.badge.warn{background:#ffecb3;color:#7a5c00}
+.muted{color:#888;font-size:14px}
+</style></head><body>
+<header><span>🍷 vin-rouge</span><span><span id="who"></span> <button id="logoutBtn" class="hidden" onclick="logout()">退出</button></span></header>
+<main>
+<!-- 登录 -->
+<div id="page-login" class="card hidden"><h2>登录</h2>
+<label>用户名</label><input id="login-user" placeholder="用户名">
+<label>密码</label><input id="login-pw" type="password" placeholder="密码">
+<button onclick="doLogin()">登录</button>
+<p class="muted">首次部署默认管理员 tristan / vin123456，登录后须立即改密码。</p>
+<p class="muted">当前版本 <span id="login-ver">…</span></p></div>
+<!-- 改密 -->
+<div id="page-chpw" class="card hidden"><h2>首次登录，请修改密码</h2>
+<label>原密码</label><input id="old-pw" type="password">
+<label>新密码（至少6位）</label><input id="new-pw" type="password">
+<button onclick="doChangePw()">修改并进入</button></div>
 
-<div class="wrap" id="main" style="display:none">
-  <header><h1>🍷 红酒进销存</h1><div class="user"><b id="uname"></b> · <a href="#" id="logout">退出</a></div></header>
-  <nav id="tabs">
-    <button data-t="stock" class="on">库存</button><button data-t="in">入库</button>
-    <button data-t="orders">货单</button><button data-t="transfer">调拨</button><button data-t="pay">应付</button>
-    <button data-t="base">档案</button><button data-t="set">设置</button>
-  </nav>
-  <div id="view"><div class="loading">加载中…</div></div>
-  <footer>红酒进销存 <span id="ver"></span></footer>
+<div id="app" class="hidden">
+<div class="nav">
+<button onclick="show('home')">首页</button><button onclick="show('inbound')">进货</button>
+<button onclick="show('opening')">补登</button><button onclick="show('outbound')">出货</button>
+<button onclick="show('transfer')">调拨</button><button onclick="show('wines')">酒库</button>
+<button onclick="show('suppliers')">供应商</button><button onclick="show('customers')">客户</button>
+<button onclick="show('orders')">单据</button><button onclick="show('users')">用户管理</button>
+<button onclick="show('audit')">操作记录</button>
 </div>
 
+<div id="page-home"><div class="grid" id="stats"></div>
+<div class="card"><h3>低库存提醒（&lt;5 瓶）</h3><div id="lowstock"></div></div>
+<button class="bigbtn" onclick="show('inbound')">＋ 进货</button>
+<button class="bigbtn" onclick="show('opening')">＋ 库存补登</button>
+<button class="bigbtn" onclick="show('outbound')">＋ 出货</button>
+<button class="bigbtn" onclick="show('transfer')">⇄ 调拨</button></div>
+
+<div id="page-wines" class="hidden"><div class="card"><h2>酒库</h2>
+<label>条码</label><input id="w-barcode" placeholder="扫码或输入条码"><button class="ghost" onclick="lookupBarcode()">扫条码查网上信息</button>
+<label>酒名 *</label><input id="w-name"><label>品牌</label><input id="w-brand">
+<label>规格（如 750ml*6瓶/箱）</label><input id="w-spec">
+<label>产地</label><input id="w-origin"><label>厂家</label><input id="w-manu">
+<label>说明</label><textarea id="w-desc"></textarea>
+<label>图片（拍照或相册，≤5MB）</label><input id="w-img" type="file" accept="image/*">
+<button onclick="saveWine()">保存酒</button><p id="w-msg" class="muted"></p></div>
+<div class="card"><h3>酒列表</h3><div id="wine-list"></div></div></div>
+
+<div id="page-suppliers" class="hidden"><div class="card"><h2>供应商</h2><div id="sup-list"></div>
+<label>名称 *</label><input id="s-name"><label>联系人</label><input id="s-contact">
+<label>电话</label><input id="s-phone"><label>地址</label><input id="s-addr">
+<button onclick="saveParty('suppliers')">新增供应商</button></div></div>
+
+<div id="page-customers" class="hidden"><div class="card"><h2>客户</h2><div id="cus-list"></div>
+<label>名称 *</label><input id="c-name"><label>联系人</label><input id="c-contact">
+<label>电话</label><input id="c-phone"><label>地址</label><input id="c-addr">
+<button onclick="saveParty('customers')">新增客户</button></div></div>
+
+<div id="page-inbound" class="hidden"><div class="card"><h2>进货单</h2>
+<label>供应商</label><select id="in-sup"></select>
+<label>仓库</label><select id="in-wh"></select>
+<label>酒</label><select id="in-wine"></select>
+<label>数量（瓶）</label><input id="in-qty" type="number" value="1">
+<label>进价（元/瓶）</label><input id="in-price" type="number" step="0.01">
+<label>物流公司</label><input id="in-carrier"><label>物流单号</label><input id="in-track">
+<label>运费（元）</label><input id="in-freight" type="number" step="0.01" value="0">
+<label><input type="checkbox" id="in-free" style="width:auto"> 包邮（运费记 0）</label>
+<label>谁付运费</label><input id="in-payer" placeholder="如：我方 / 供应商">
+<label>本次已付货款（元，可 0）</label><input id="in-paid" type="number" step="0.01" value="0">
+<label>备注</label><input id="in-note">
+<button onclick="submitInbound()">提交进货</button><p id="in-msg"></p></div></div>
+
+<div id="page-opening" class="hidden"><div class="card"><h2>库存补登（期初）</h2>
+<label>仓库</label><select id="op-wh"></select>
+<label>酒</label><select id="op-wine"></select>
+<label>数量（瓶）</label><input id="op-qty" type="number" value="1">
+<label>成本价（元/瓶，可空）</label><input id="op-price" type="number" step="0.01">
+<label>批次（可空）</label><input id="op-batch">
+<label>日期（可回填）</label><input id="op-date" type="date">
+<label>备注</label><input id="op-note">
+<button onclick="submitOpening()">提交补登</button><p id="op-msg"></p></div></div>
+
+<div id="page-outbound" class="hidden"><div class="card"><h2>出货单</h2>
+<label>出库类型</label><select id="out-type" onchange="outTypeChanged()">
+<option value="sale">销售出库</option><option value="personal">自饮</option>
+<option value="gift">赠送</option><option value="damage">破损</option></select>
+<label>日期</label><input id="out-date" type="date">
+<label>客户</label><select id="out-cus"></select>
+<label>仓库</label><select id="out-wh"></select>
+<label>酒</label><select id="out-wine"></select>
+<label>数量（瓶）</label><input id="out-qty" type="number" value="1">
+<label>卖价（元/瓶）</label><input id="out-price" type="number" step="0.01">
+<div id="out-discount">
+<label>折扣率（如 0.9 为 9 折，留空不打折）</label><input id="out-rate" type="number" step="0.01" min="0" max="1">
+<label>折后单价（元/瓶，与折扣率二选一，填了就按这个算）</label><input id="out-dprice" type="number" step="0.01">
+<label>瑕疵/打折原因（打折必填，如瓶身划痕、包装破损）</label><input id="out-reason">
+</div>
+<label>物流公司</label><input id="out-carrier"><label>物流单号</label><input id="out-track">
+<label>运费（元）</label><input id="out-freight" type="number" step="0.01" value="0">
+<label><input type="checkbox" id="out-free" style="width:auto"> 包邮（运费记 0）</label>
+<label>谁付运费</label><input id="out-payer" placeholder="如：我方 / 客户">
+<label>本次已收货款（元，可 0）</label><input id="out-paid" type="number" step="0.01" value="0">
+<label>备注</label><input id="out-note">
+<button onclick="submitOutbound()">提交出货</button><p id="out-msg"></p></div></div>
+
+<div id="page-transfer" class="hidden"><div class="card"><h2>调拨</h2>
+<label>酒</label><select id="tr-wine"></select>
+<label>从仓库</label><select id="tr-from"></select>
+<label>到仓库</label><select id="tr-to"></select>
+<label>数量（瓶）</label><input id="tr-qty" type="number" value="1">
+<button onclick="submitTransfer()">一键调拨</button><p id="tr-msg"></p></div></div>
+
+<div id="page-orders" class="hidden"><div class="card"><h2>单据</h2>
+<button class="ghost" onclick="loadOrders('inbound')">进货/补登单</button>
+<button class="ghost" onclick="loadOrders('outbound')">出货单</button>
+<button class="ghost" onclick="loadOrders('transfers')">调拨单</button>
+<div id="order-list"></div>
+<div id="order-detail"></div></div></div>
+
+<div id="page-users" class="hidden"><div class="card"><h2>用户管理（所有管理员权限相同）</h2>
+<div id="user-list"></div>
+<label>用户名 *</label><input id="u-name"><label>显示名</label><input id="u-disp">
+<label>密码 *</label><input id="u-pw" type="password">
+<button onclick="saveUser()">新增管理员</button></div></div>
+
+<div id="page-audit" class="hidden"><div class="card"><h2>操作记录</h2><div id="audit-list"></div></div></div>
+</div>
+<footer class="muted" style="text-align:center;padding:8px 0 16px">vin-rouge <span id="ver">…</span></footer>
+</main>
 <script>
-const $=s=>document.querySelector(s), el=(t,c,h)=>{const e=document.createElement(t);if(c)e.className=c;if(h!=null)e.innerHTML=h;return e};
-const esc=s=>String(s??"").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[m]));
-const money=c=>"¥"+(c/100).toFixed(2);
-const today=()=>new Date().toISOString().slice(0,10);
-let DATA={products:[],suppliers:[],customers:[],warehouses:[]};
-async function api(path,opt={}){
-  const r=await fetch(path,{headers:{"Content-Type":"application/json"},...opt});
-  const d=await r.json().catch(()=>({}));
-  if(!r.ok) throw new Error(d.detail||("请求失败 "+r.status));
-  return d;
-}
-async function busy(btn,fn){
-  const old=btn.textContent; btn.disabled=true; btn.textContent="处理中…";
-  try{await fn()}catch(e){alert(e.message)}finally{btn.disabled=false;btn.textContent=btn.dataset.label||old}
-}
-function loading(v){v.innerHTML='<div class="loading">加载中…</div>'}
-async function loadBase(){
-  [DATA.products,DATA.suppliers,DATA.customers,DATA.warehouses]=await Promise.all(
-    [api("/api/products"),api("/api/suppliers"),api("/api/customers"),api("/api/warehouses")]);
-}
-const prodName=id=>(DATA.products.find(p=>p.id==id)||{}).name||("#"+id);
-const prodLabel=p=>p.type==="酒"&&p.vintage?`${p.name} ${p.vintage}`:p.name;
-
-/* ---------------- 库存 ---------------- */
-async function vStock(v){
-  loading(v);
-  const head=el("div","card",`<div class="row"><b>库存</b><span>
-    <button class="btn sm sec" data-v="product">按商品</button>
-    <button class="btn sm sec" data-v="warehouse">按仓库</button>
-    <button class="btn sm sec" data-v="batch">按批次</button>
-    <button class="btn sm sec" data-v="txns">流水</button></span></div><div id="stock-body" class="loading">加载中…</div>`);
-  v.replaceChildren(head);
-  const body=head.querySelector("#stock-body");
-  async function show(kind){
-    body.className="loading"; body.textContent="加载中…";
-    try{
-      if(kind==="txns"){
-        const rows=await api("/api/inventory-txns");
-        body.className=""; body.innerHTML=rows.length?`<table><tr><th>类型</th><th>商品</th><th>仓库</th><th class="num">增减</th><th>单号</th></tr>${
-          rows.map(r=>`<tr><td>${esc(r.txn_type)}</td><td>${esc(r.product_name)}<div class="small">${esc(r.created_at.slice(0,16).replace("T"," "))}</div></td><td>${esc(r.warehouse_name||"")}</td><td class="num">${r.qty_delta>0?"+":""}${r.qty_delta}</td><td class="small">${esc(r.note)}</td></tr>`).join("")}</table>`:"暂无流水";
-      }else if(kind==="batch"){
-        const rows=await api("/api/inventory?view=batch");
-        body.className=""; body.innerHTML=rows.length?rows.map(r=>`<div class="line"><div class="row"><b>${esc(r.product_name)}${r.vintage?" "+esc(r.vintage):""}</b><span class="pill">剩 ${r.qty_remaining}/${r.qty_initial}</span></div>
-          <div class="small">批次#${r.batch_id} · ${esc(r.biz_date)} · ${esc(r.supplier_name||"期初")} · 进价 ${money(r.unit_price_cents)} · 实际成本 ¥${Number(r.unit_cost).toFixed(2)}<br>存放: ${esc(r.locations||"无")}</div></div>`).join(""):"暂无批次";
-      }else if(kind==="warehouse"){
-        const rows=await api("/api/inventory?view=warehouse");
-        body.className=""; body.innerHTML=rows.length?`<table><tr><th>仓库</th><th>商品</th><th class="num">总量</th><th class="num">预定</th><th class="num">可用</th></tr>${
-          rows.map(r=>`<tr><td>${esc(r.warehouse_name)}</td><td>${esc(r.product_name)}${r.vintage?" "+esc(r.vintage):""}</td><td class="num">${r.qty}</td><td class="num">${r.reserved_qty||0}</td><td class="num">${r.available_qty??r.qty}</td></tr>`).join("")}</table>`:"暂无库存";
-      }else{
-        const rows=await api("/api/inventory?view=product");
-        const tot=rows.reduce((s,r)=>s+r.qty,0), val=rows.reduce((s,r)=>s+r.value_cents,0);
-        body.className=""; body.innerHTML=`<div class="small" style="margin:6px 0">共 ${tot} 件 · 库存成本约 ${money(Math.round(val))}</div>`+(rows.length?rows.map(r=>`<div class="line"><div class="row"><b>${esc(r.product_name)}${r.vintage?" "+esc(r.vintage):""}</b><span class="pill">可用 ${r.available_qty??r.qty} 件</span></div>
-          <div class="small">${esc(r.type)}${r.category?" · "+esc(r.category):""}${r.origin?" · "+esc(r.origin):""} · 总量 ${r.qty} · 已预定 ${r.reserved_qty||0} · 成本约 ${money(Math.round(r.value_cents))}</div></div>`).join(""):"暂无商品，先到「档案」建商品，再到「入库」录库存");
-      }
-    }catch(e){body.className="err";body.textContent=e.message}
-  }
-  head.querySelectorAll("[data-v]").forEach(b=>b.onclick=()=>show(b.dataset.v));
-  show("product");
-}
-
-/* ---------------- 入库 ---------------- */
-async function vIn(v){
-  loading(v); await loadBase();
-  const card=el("div","card");
-  card.innerHTML=`<b>新建入库单</b>
-    <div class="grid2"><div><label>单据类型</label><select id="p-type"><option>采购入库</option><option>期初库存</option></select></div>
-    <div><label>日期</label><input id="p-date" type="date" value="${today()}"></div></div>
-    <div class="grid2"><div><label>供应商(采购必填)</label><select id="p-sup"><option value="">—</option>${DATA.suppliers.map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select></div>
-    <div><label>入库仓库</label><select id="p-wh">${DATA.warehouses.map(w=>`<option value="${w.id}">${esc(w.name)}</option>`).join("")}</select></div></div>
-    <div id="p-lines"></div>
-    <button class="btn sm sec" id="p-add" style="margin-top:8px">+ 加一行</button>
-    <div class="grid2"><div><label>运费(元,没有填0;按金额比例分摊进成本)</label><input id="p-freight" inputmode="decimal" value="0"></div>
-    <div><label>付款状态(采购入库)</label><select id="p-pay"><option>未付款</option><option>已付款</option></select></div></div>
-    <label>备注</label><input id="p-note">
-    <div style="margin-top:12px"><button class="btn" id="p-submit" style="width:100%">确认入库</button>
-    <button class="btn sec" id="p-cancel-edit" style="width:100%;margin-top:6px;display:none">取消修改</button></div>
-    <div class="ok" id="p-ok"></div><div class="err" id="p-err"></div>`;
-  const listCard=el("div","card",`<b>入库单</b><div id="p-list" class="loading">加载中…</div>`);
-  v.replaceChildren(card,listCard);
-  const linesBox=card.querySelector("#p-lines");
-  function addLine(data){
-    const d=el("div","line");
-    d.innerHTML=`<div class="grid3"><div><label>商品</label><select class="ln-p">${DATA.products.map(p=>`<option value="${p.id}">${esc(prodLabel(p))}(${esc(p.type)})</option>`).join("")}</select></div>
-      <div><label>数量</label><input class="ln-q" type="number" min="1" value="1"></div>
-      <div><label>进价(元/件)</label><input class="ln-u" inputmode="decimal" value="0"></div></div>
-      <button class="btn sm sec ln-del" style="margin-top:6px">删此行</button>`;
-    d.querySelector(".ln-del").onclick=()=>d.remove();
-    if(data){d.querySelector(".ln-p").value=data.product_id;d.querySelector(".ln-q").value=data.qty;d.querySelector(".ln-u").value=String(data.unit_price_cents/100)}
-    linesBox.appendChild(d);
-  }
-  addLine();
-  card.querySelector("#p-add").onclick=()=>addLine();
-  let pRows=[];
-  function setEditMode(o){
-    const btn=card.querySelector("#p-submit"), cancelBtn=card.querySelector("#p-cancel-edit");
-    if(o){
-      card.dataset.editId=o.id; btn.textContent="保存修改"; btn.dataset.label="保存修改"; cancelBtn.style.display="block";
-      const typeSel=card.querySelector("#p-type"); typeSel.value=o.type; typeSel.disabled=true;
-      card.querySelector("#p-date").value=o.biz_date;
-      card.querySelector("#p-sup").value=o.supplier_id||"";
-      card.querySelector("#p-wh").value=o.warehouse_id;
-      card.querySelector("#p-freight").value=String(o.freight_cents/100);
-      card.querySelector("#p-pay").value=o.pay_status||"未付款";
-      card.querySelector("#p-note").value=o.note||"";
-      linesBox.replaceChildren(); o.lines.forEach(addLine);
-      card.scrollIntoView({behavior:"smooth"});
-    }else{
-      delete card.dataset.editId; btn.textContent="确认入库"; btn.dataset.label="确认入库"; cancelBtn.style.display="none";
-      card.querySelector("#p-type").disabled=false;
-      linesBox.replaceChildren(); addLine();
-    }
-  }
-  card.querySelector("#p-cancel-edit").onclick=()=>setEditMode(null);
-  async function refreshList(){
-    const box=listCard.querySelector("#p-list");
-    try{
-      const rows=await api("/api/purchase-orders"); pRows=rows;
-      box.className=""; box.innerHTML=rows.length?rows.map(o=>`<div class="line"><div class="row"><b>${esc(o.order_no)}</b><span class="pill ${o.status==="已作废"?"gray":""}">${esc(o.status)}</span></div>
-        <div class="small">${esc(o.type)} · ${esc(o.biz_date)} · ${esc(o.supplier_name||"—")} → ${esc(o.warehouse_name)} · 货款 ${money(o.goods_cents)} + 运费 ${money(o.freight_cents)} = <b>${money(o.total_cents)}</b>${o.type==="采购入库"?" · "+esc(o.pay_status||"未付款"):""}</div>
-        <div class="small">${o.lines.map(l=>`${esc(l.product_name)}×${l.qty}@${money(l.unit_price_cents)}`).join("、")}</div>
-        ${o.status!=="已作废"?`<button class="btn sm sec" data-edit="${o.id}" style="margin-top:6px">修改</button> <button class="btn sm sec" data-cancel="${o.id}" style="margin-top:6px">作废重录</button>`:""}</div>`).join(""):"暂无入库单";
-      box.querySelectorAll("[data-edit]").forEach(b=>b.onclick=()=>{
-        const o=pRows.find(x=>x.id==b.dataset.edit); if(o)setEditMode(o);});
-      box.querySelectorAll("[data-cancel]").forEach(b=>b.onclick=()=>busy(b,async()=>{
-        if(!confirm("作废这张单?库存和应付会冲销(已付款/已调拨的不能作废)"))return;
-        await api(`/api/purchase-orders/${b.dataset.cancel}/cancel`,{method:"POST",body:"{}"});
-        refreshList();
-      }));
-    }catch(e){box.className="err";box.textContent=e.message}
-  }
-  refreshList();
-  card.querySelector("#p-submit").onclick=e=>busy(e.target,async()=>{
-    const err=card.querySelector("#p-err"), ok=card.querySelector("#p-ok"); err.textContent=""; ok.textContent="";
-    const lines=[...linesBox.children].map(d=>({product_id:+d.querySelector(".ln-p").value,qty:+d.querySelector(".ln-q").value,unit_price:d.querySelector(".ln-u").value||"0"}));
-    try{
-      if(card.dataset.editId){
-        await api(`/api/purchase-orders/${card.dataset.editId}`,{method:"PUT",body:JSON.stringify({
-          supplier_id:card.querySelector("#p-sup").value?+card.querySelector("#p-sup").value:null,
-          warehouse_id:+card.querySelector("#p-wh").value,
-          biz_date:card.querySelector("#p-date").value,
-          freight:card.querySelector("#p-freight").value||"0",
-          pay_status:card.querySelector("#p-pay").value,
-          lines, note:card.querySelector("#p-note").value})});
-        ok.textContent="修改已保存"; setEditMode(null); refreshList(); return;
-      }
-      const r=await api("/api/purchase-orders",{method:"POST",body:JSON.stringify({
-        type:card.querySelector("#p-type").value,
-        supplier_id:card.querySelector("#p-sup").value?+card.querySelector("#p-sup").value:null,
-        warehouse_id:+card.querySelector("#p-wh").value,
-        biz_date:card.querySelector("#p-date").value,
-        freight:card.querySelector("#p-freight").value||"0",
-        pay_status:card.querySelector("#p-pay").value,
-        lines, note:card.querySelector("#p-note").value,
-        idempotency_key:card.dataset.idem||(card.dataset.idem=crypto.randomUUID())})});
-      ok.textContent=`入库成功:${r.order_no}${r.duplicated?"(重复提交,已忽略)":""}`;
-      delete card.dataset.idem; refreshList();
-    }catch(ex){err.textContent=ex.message}
-  });
-}
-
-/* ---------------- 货单 ---------------- */
-async function vOrders(v){
-  loading(v); await loadBase();
-  const card=el("div","card");
-  card.innerHTML=`<b>新建客户货单</b><div class="small">建单先预定库存(不扣),发货时才真正出库</div>
-    <div class="grid2"><div><label>客户</label><select id="o-cust">${DATA.customers.map(s=>`<option value="${s.id}">${esc(s.name)}</option>`).join("")}</select></div>
-    <div><label>出库仓库</label><select id="o-wh">${DATA.warehouses.map(w=>`<option value="${w.id}">${esc(w.name)}</option>`).join("")}</select></div></div>
-    <div id="o-lines"></div>
-    <button class="btn sm sec" id="o-add" style="margin-top:8px">+ 加一行</button>
-    <div class="grid3"><div><label>运费(元)</label><input id="o-freight" inputmode="decimal" value="0"></div>
-    <div><label>运费承担</label><select id="o-payer"><option>客户付</option><option>自提无</option><option>我方代付</option></select></div>
-    <div><label>付款状态</label><select id="o-pay"><option>未付款</option><option>已付款</option></select></div></div>
-    <label>物流号(可发货时再填)</label><input id="o-log">
-    <label>备注</label><input id="o-note">
-    <div style="margin-top:12px"><button class="btn" id="o-submit" style="width:100%">生成货单</button>
-    <button class="btn sec" id="o-cancel-edit" style="width:100%;margin-top:6px;display:none">取消修改</button></div>
-    <div class="ok" id="o-ok"></div><div class="err" id="o-err"></div>`;
-  const listCard=el("div","card",`<b>货单</b><div id="o-list" class="loading">加载中…</div>`);
-  v.replaceChildren(card,listCard);
-  const linesBox=card.querySelector("#o-lines");
-  function addLine(data){
-    const d=el("div","line");
-    d.innerHTML=`<div class="grid3"><div><label>商品</label><select class="ln-p">${DATA.products.map(p=>`<option value="${p.id}">${esc(prodLabel(p))}(${esc(p.type)})</option>`).join("")}</select></div>
-      <div><label>数量</label><input class="ln-q" type="number" min="1" value="1"></div>
-      <div><label>单价(元)</label><input class="ln-u" inputmode="decimal" value="0"></div></div>
-      <div class="grid2"><div><label>类型</label><select class="ln-t"><option>销售</option><option>赠送</option></select></div>
-      <div><button class="btn sm sec ln-del" style="margin-top:22px">删此行</button></div></div>`;
-    d.querySelector(".ln-del").onclick=()=>d.remove();
-    if(data){d.querySelector(".ln-p").value=data.product_id;d.querySelector(".ln-q").value=data.qty;d.querySelector(".ln-u").value=String(data.unit_price_cents/100);d.querySelector(".ln-t").value=data.line_type}
-    linesBox.appendChild(d);
-  }
-  addLine();
-  card.querySelector("#o-add").onclick=()=>addLine();
-  let oRows=[];
-  function setEditMode(o){
-    const btn=card.querySelector("#o-submit"), cancelBtn=card.querySelector("#o-cancel-edit");
-    if(o){
-      card.dataset.editId=o.id; btn.textContent="保存修改"; btn.dataset.label="保存修改"; cancelBtn.style.display="block";
-      card.querySelector("#o-cust").value=o.customer_id;
-      card.querySelector("#o-wh").value=o.warehouse_id;
-      card.querySelector("#o-freight").value=String(o.freight_cents/100);
-      card.querySelector("#o-payer").value=o.freight_payer;
-      card.querySelector("#o-pay").disabled=true;
-      card.querySelector("#o-log").value=o.logistics_no||"";
-      card.querySelector("#o-note").value=o.note||"";
-      linesBox.replaceChildren(); o.lines.forEach(addLine);
-      card.scrollIntoView({behavior:"smooth"});
-    }else{
-      delete card.dataset.editId; btn.textContent="生成货单"; btn.dataset.label="生成货单"; cancelBtn.style.display="none";
-      card.querySelector("#o-pay").disabled=false;
-      linesBox.replaceChildren(); addLine();
-    }
-  }
-  card.querySelector("#o-cancel-edit").onclick=()=>setEditMode(null);
-  async function refresh(){
-    const box=listCard.querySelector("#o-list");
-    try{
-      const rows=await api("/api/sales-orders"); oRows=rows;
-      box.className=""; box.innerHTML=rows.length?rows.map(o=>{
-        const cancelled=o.order_status==="已取消";
-        const st=cancelled?"已取消":`${o.ship_status} · ${o.pay_status}`;
-        return `<div class="line"><div class="row"><b>${esc(o.order_no)}</b><span class="pill ${cancelled?"gray":""}">${esc(st)}</span></div>
-        <div class="small">${esc(o.customer_name)} · ${esc(o.warehouse_name)} · ${esc(o.biz_date)} · 总计 <b>${money(o.total_cents)}</b>(货款 ${money(o.goods_cents)} + 运费 ${money(o.freight_cents)} ${esc(o.freight_payer)})${o.cost_cents?` · 成本 ${money(o.cost_cents)}`:""}</div>
-        <div class="small">${o.lines.map(l=>`${esc(l.product_name)}×${l.qty}@${money(l.unit_price_cents)}${l.line_type==="赠送"?"(赠送)":""}`).join("、")}</div>
-        <div class="small">物流号:${esc(o.logistics_no||"—")} · 发货时间:${esc((o.ship_time||"—").replace("T"," ").slice(0,16))}</div>
-        ${cancelled?`<div class="small">取消原因:${esc(o.cancel_reason||"—")}</div>`:`<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
-          ${o.ship_status!=="已发货"?`<input id="log-${o.id}" placeholder="物流号" value="${esc(o.logistics_no||"")}" style="flex:1 1 140px"><button class="btn sm" data-ship="${o.id}">发货出库</button><button class="btn sm sec" data-edit="${o.id}">修改货单</button>`:`<button class="btn sm sec" data-edit-shipped="${o.id}">改物流号/备注</button>`}
-          <button class="btn sm sec" data-payst="${o.id}" data-next="${o.pay_status==="已付款"?"未付款":"已付款"}">${o.pay_status==="已付款"?"改未付款":"改已付款"}</button>
-          <button class="btn sm sec" data-copy="${esc(o.public_path)}">复制客户链接</button>
-          ${o.ship_status!=="已发货"?`<button class="btn sm sec" data-cancel="${o.id}">取消货单</button>`:""}</div>${o.ship_status==="已发货"?`<div class="small">已发货:明细不可改,只能改物流号/备注/付款状态</div>`:""}`}</div>`}).join(""):"暂无货单";
-      box.querySelectorAll("[data-edit]").forEach(b=>b.onclick=()=>{
-        const o=oRows.find(x=>x.id==b.dataset.edit); if(o)setEditMode(o);});
-      box.querySelectorAll("[data-edit-shipped]").forEach(b=>b.onclick=()=>busy(b,async()=>{
-        const o=oRows.find(x=>x.id==b.dataset.editShipped); if(!o)return;
-        const log=prompt("物流号:",o.logistics_no||""); if(log===null)return;
-        const note=prompt("备注:",o.note||""); if(note===null)return;
-        await api(`/api/sales-orders/${o.id}`,{method:"PUT",body:JSON.stringify({
-          customer_id:o.customer_id,warehouse_id:o.warehouse_id,biz_date:o.biz_date,
-          lines:o.lines.map(l=>({product_id:l.product_id,qty:l.qty,unit_price:String(l.unit_price_cents/100),line_type:l.line_type})),
-          freight:String(o.freight_cents/100),freight_payer:o.freight_payer,
-          logistics_no:log,note})});
-        refresh();}));
-      box.querySelectorAll("[data-ship]").forEach(b=>b.onclick=()=>busy(b,async()=>{
-        const log=box.querySelector(`#log-${b.dataset.ship}`).value;
-        await api(`/api/sales-orders/${b.dataset.ship}/ship`,{method:"POST",body:JSON.stringify({logistics_no:log,ship_time:""})});
-        refresh();}));
-      box.querySelectorAll("[data-payst]").forEach(b=>b.onclick=()=>busy(b,async()=>{
-        await api(`/api/sales-orders/${b.dataset.payst}/pay-status`,{method:"POST",body:JSON.stringify({pay_status:b.dataset.next})});
-        refresh();}));
-      box.querySelectorAll("[data-cancel]").forEach(b=>b.onclick=()=>busy(b,async()=>{
-        const reason=prompt("取消原因(可空,记录保留):","")??"";
-        await api(`/api/sales-orders/${b.dataset.cancel}/cancel`,{method:"POST",body:JSON.stringify({reason})});
-        refresh();}));
-      box.querySelectorAll("[data-copy]").forEach(b=>b.onclick=async()=>{
-        const url=location.origin+b.dataset.copy;
-        try{await navigator.clipboard.writeText(url);b.textContent="已复制"}catch(e){prompt("复制这个链接发给客户:",url)}});
-    }catch(e){box.className="err";box.textContent=e.message}
-  }
-  refresh();
-  card.querySelector("#o-submit").onclick=e=>busy(e.target,async()=>{
-    const err=card.querySelector("#o-err"),ok=card.querySelector("#o-ok");err.textContent="";ok.textContent="";
-    const lines=[...linesBox.children].map(d=>({product_id:+d.querySelector(".ln-p").value,qty:+d.querySelector(".ln-q").value,unit_price:d.querySelector(".ln-u").value||"0",line_type:d.querySelector(".ln-t").value}));
-    try{
-      if(card.dataset.editId){
-        await api(`/api/sales-orders/${card.dataset.editId}`,{method:"PUT",body:JSON.stringify({
-          customer_id:+card.querySelector("#o-cust").value,warehouse_id:+card.querySelector("#o-wh").value,
-          lines,freight:card.querySelector("#o-freight").value||"0",
-          freight_payer:card.querySelector("#o-payer").value,
-          logistics_no:card.querySelector("#o-log").value,note:card.querySelector("#o-note").value})});
-        ok.textContent="修改已保存"; setEditMode(null); refresh(); return;
-      }
-      const r=await api("/api/sales-orders",{method:"POST",body:JSON.stringify({
-        customer_id:+card.querySelector("#o-cust").value,warehouse_id:+card.querySelector("#o-wh").value,
-        biz_date:today(),lines,freight:card.querySelector("#o-freight").value||"0",
-        freight_payer:card.querySelector("#o-payer").value,pay_status:card.querySelector("#o-pay").value,
-        logistics_no:card.querySelector("#o-log").value,note:card.querySelector("#o-note").value,
-        idempotency_key:card.dataset.idem||(card.dataset.idem=crypto.randomUUID())})});
-      ok.textContent=`货单已生成:${r.order_no} 客户链接:${location.origin}${r.public_path}`;
-      delete card.dataset.idem; refresh();
-    }catch(ex){err.textContent=ex.message}
-  });
-}
-
-/* ---------------- 调拨 ---------------- */
-async function vTransfer(v){
-  loading(v); await loadBase();
-  const batches=await api("/api/inventory?view=batch");
-  const card=el("div","card");
-  card.innerHTML=`<b>新建调拨单</b><div class="small">只挪存放仓库,不动钱;按批次调</div>
-    <div class="grid3"><div><label>调出仓</label><select id="t-from">${DATA.warehouses.map(w=>`<option value="${w.id}">${esc(w.name)}</option>`).join("")}</select></div>
-    <div><label>调入仓</label><select id="t-to">${DATA.warehouses.map(w=>`<option value="${w.id}">${esc(w.name)}</option>`).join("")}</select></div>
-    <div><label>日期</label><input id="t-date" type="date" value="${today()}"></div></div>
-    <div class="grid2"><div><label>批次(商品·剩/总数·存放)</label><select id="t-batch">${batches.filter(b=>b.qty_remaining>0).map(b=>`<option value="${b.batch_id}">#${b.batch_id} ${esc(b.product_name)}${b.vintage?" "+esc(b.vintage):""} · 剩${b.qty_remaining} · ${esc(b.locations||"")}</option>`).join("")}</select></div>
-    <div><label>数量</label><input id="t-qty" type="number" min="1" value="1"></div></div>
-    <div style="margin-top:12px"><button class="btn" id="t-submit" style="width:100%">确认调拨</button></div>
-    <div class="ok" id="t-ok"></div><div class="err" id="t-err"></div>`;
-  const listCard=el("div","card",`<b>调拨单</b><div id="t-list" class="loading">加载中…</div>`);
-  v.replaceChildren(card,listCard);
-  async function refresh(){
-    const box=listCard.querySelector("#t-list");
-    try{const rows=await api("/api/transfers"); box.className="";
-      box.innerHTML=rows.length?rows.map(t=>`<div class="line"><div class="row"><b>${esc(t.transfer_no)}</b><span class="small">${esc(t.biz_date)}</span></div>
-      <div class="small">${esc(t.from_name)} → ${esc(t.to_name)} · ${t.lines.map(l=>`${esc(l.product_name)}×${l.qty}(批次#${l.batch_id})`).join("、")}</div>
-      <button class="btn sm sec" data-tedit="${t.id}" style="margin-top:6px">修改</button>
-      <div id="tedit-${t.id}" style="display:none"></div></div>`).join(""):"暂无调拨单";
-      box.querySelectorAll("[data-tedit]").forEach(b=>b.onclick=()=>{
-        const t=rows.find(x=>x.id==b.dataset.tedit); const div=box.querySelector(`#tedit-${t.id}`);
-        if(div.style.display!=="none"){div.style.display="none";return}
-        const batchOpts=batches.filter(x=>x.qty_remaining>0||t.lines.some(l=>l.batch_id===x.batch_id));
-        div.innerHTML=`<div class="grid2"><div><label>调入仓</label><select class="te-to">${DATA.warehouses.map(w=>`<option value="${w.id}">${esc(w.name)}</option>`).join("")}</select></div>
-        <div><label>日期</label><input class="te-date" type="date" value="${esc(t.biz_date)}"></div></div>
-        ${t.lines.map(l=>`<div class="grid2 te-line"><div><label>批次</label><select class="te-batch">${batchOpts.map(x=>`<option value="${x.batch_id}">#${x.batch_id} ${esc(x.product_name)}${x.vintage?" "+esc(x.vintage):""} · 剩${x.qty_remaining}</option>`).join("")}</select></div>
-        <div><label>数量</label><input class="te-qty" type="number" min="1" value="${l.qty}"></div></div>`).join("")}
-        <label>备注</label><input class="te-note" value="${esc(t.note||"")}">
-        <div style="margin-top:8px"><button class="btn sm te-save">保存修改</button></div><div class="err te-err"></div>`;
-        div.querySelector(".te-to").value=t.to_warehouse_id;
-        div.querySelectorAll(".te-line").forEach((row,i)=>{row.querySelector(".te-batch").value=t.lines[i].batch_id});
-        div.style.display="block";
-        div.querySelector(".te-save").onclick=e=>busy(e.target,async()=>{
-          div.querySelector(".te-err").textContent="";
-          try{await api(`/api/transfers/${t.id}`,{method:"PUT",body:JSON.stringify({
-            to_warehouse_id:+div.querySelector(".te-to").value,
-            biz_date:div.querySelector(".te-date").value,
-            lines:[...div.querySelectorAll(".te-line")].map(row=>({batch_id:+row.querySelector(".te-batch").value,qty:+row.querySelector(".te-qty").value})),
-            note:div.querySelector(".te-note").value})});
-            refresh();
-          }catch(ex){div.querySelector(".te-err").textContent=ex.message}
-        });
-      });
-    }catch(e){box.className="err";box.textContent=e.message}
-  }
-  refresh();
-  card.querySelector("#t-submit").onclick=e=>busy(e.target,async()=>{
-    const err=card.querySelector("#t-err"),ok=card.querySelector("#t-ok");err.textContent="";ok.textContent="";
-    try{const r=await api("/api/transfers",{method:"POST",body:JSON.stringify({
-      from_warehouse_id:+card.querySelector("#t-from").value,to_warehouse_id:+card.querySelector("#t-to").value,
-      biz_date:card.querySelector("#t-date").value,
-      lines:[{batch_id:+card.querySelector("#t-batch").value,qty:+card.querySelector("#t-qty").value}],
-      idempotency_key:crypto.randomUUID()})});
-      ok.textContent=`调拨成功:${r.transfer_no}`; refresh();
-    }catch(ex){err.textContent=ex.message}
-  });
-}
-
-/* ---------------- 应付 ---------------- */
-async function vPay(v){
-  loading(v);
-  const card=el("div","card",`<b>应付供应商</b><div id="pay-body" class="loading">加载中…</div>`);
-  v.replaceChildren(card);
-  const body=card.querySelector("#pay-body");
-  try{
-    const rows=await api("/api/payables");
-    const due=rows.reduce((s,r)=>s+r.balance_cents,0);
-    body.className=""; body.innerHTML=`<div class="small" style="margin:6px 0">未付合计 <b>${money(due)}</b></div>`+(rows.length?rows.map(r=>`<div class="line">
-      <div class="row"><b>${esc(r.supplier_name)}</b><span class="pill ${r.balance_cents?"":"gray"}">${r.balance_cents?"未付 "+money(r.balance_cents):"已付清"}</span></div>
-      <div class="small">${esc(r.order_no)} · ${esc(r.biz_date)} · 应付 ${money(r.amount_cents)} · 已付 ${money(r.paid_cents)}</div>
-      ${r.payments.map(p=>`<div class="small">↳ ${esc(p.pay_date)} 付 ${money(p.amount_cents)} ${esc(p.note)} <button class="btn sm sec" data-pedit="${p.id}" data-amt="${p.amount_cents}" data-date="${esc(p.pay_date)}" data-note="${esc(p.note||"")}">修改</button></div><div id="pedit-${p.id}" style="display:none"></div>`).join("")}
-      ${r.balance_cents?`<div class="grid2" style="margin-top:6px"><input id="amt-${r.id}" inputmode="decimal" placeholder="付款金额(元)"><button class="btn sm" data-pay="${r.id}">登记付款</button></div>`:""}</div>`).join(""):"暂无应付(期初库存不产生应付)");
-    body.querySelectorAll("[data-pedit]").forEach(b=>b.onclick=()=>{
-      const div=body.querySelector(`#pedit-${b.dataset.pedit}`);
-      if(div.style.display!=="none"){div.style.display="none";return}
-      div.innerHTML=`<div class="grid3"><div><label>金额(元)</label><input class="pe-amt" inputmode="decimal" value="${String(+b.dataset.amt/100)}"></div>
-      <div><label>日期</label><input class="pe-date" type="date" value="${esc(b.dataset.date)}"></div>
-      <div><label>备注</label><input class="pe-note" value="${esc(b.dataset.note)}"></div></div>
-      <div style="margin-top:8px"><button class="btn sm pe-save">保存修改</button></div><div class="err pe-err"></div>`;
-      div.style.display="block";
-      div.querySelector(".pe-save").onclick=e=>busy(e.target,async()=>{
-        div.querySelector(".pe-err").textContent="";
-        try{await api(`/api/payments/${b.dataset.pedit}`,{method:"PUT",body:JSON.stringify({
-          amount:div.querySelector(".pe-amt").value||"0",
-          pay_date:div.querySelector(".pe-date").value,
-          note:div.querySelector(".pe-note").value})});
-          vPay(v);
-        }catch(ex){div.querySelector(".pe-err").textContent=ex.message}
-      });
-    });
-    body.querySelectorAll("[data-pay]").forEach(b=>b.onclick=()=>busy(b,async()=>{
-      const amt=body.querySelector(`#amt-${b.dataset.pay}`).value;
-      await api(`/api/payables/${b.dataset.pay}/payments`,{method:"POST",body:JSON.stringify({amount:amt,pay_date:today(),note:""})});
-      vPay(v);
-    }));
-  }catch(e){body.className="err";body.textContent=e.message}
-}
-
-/* ---------------- 档案 ---------------- */
-let BASE_SUB="wine";
-async function vBase(v){
-  loading(v); await loadBase();
-  const wrap=el("div");
-  const subs=[["wine","红酒"],["acc","附件"],["sup","供应商"],["cust","客户"],["wh","仓库"]];
-  const subnav=el("nav","subnav",subs.map(([k,t])=>`<button data-s="${k}" class="${BASE_SUB===k?"on":""}">${t}</button>`).join(""));
-  subnav.querySelectorAll("button").forEach(b=>b.onclick=()=>{BASE_SUB=b.dataset.s;vBase(v)});
-  wrap.appendChild(subnav);
-  function section(title,items,formHtml,readBody,url,fmt,fill,searchable){
-    const c=el("div","card",`<b>${title}</b>${searchable?'<input class="f-search" placeholder="搜索名字…" style="margin-top:8px">':""}<div>${items.length?items.map(fmt).join(""):'<div class="small">暂无</div>'}</div><div class="line">${formHtml}<button class="btn sm" style="margin-top:8px">添加</button><div class="err"></div></div>`);
-    if(searchable){const s=c.querySelector(".f-search");s.oninput=()=>{const q=s.value.trim();c.querySelectorAll("[data-edit]").forEach(b=>{const ln=b.closest(".line");ln.style.display=(!q||ln.textContent.includes(q))?"":"none"})}}
-    c.querySelector(":scope > .line > button").onclick=e=>busy(e.target,async()=>{try{await api(url,{method:"POST",body:JSON.stringify(readBody(c))});vBase(v)}catch(ex){c.querySelector(".err").textContent=ex.message}});
-    c.querySelectorAll("[data-edit]").forEach(b=>b.onclick=()=>{
-      const item=items.find(x=>x.id==b.dataset.edit); const div=c.querySelector(`#edit-${url.split("/").pop()}-${item.id}`);
-      if(div.style.display!=="none"){div.style.display="none";return}
-      div.innerHTML=`${formHtml}<div style="margin-top:8px"><button class="btn sm">保存修改</button></div><div class="err"></div>`;
-      fill(div,item); div.style.display="block";
-      div.querySelector("button").onclick=e=>busy(e.target,async()=>{
-        try{await api(`${url}/${item.id}`,{method:"PUT",body:JSON.stringify(readBody(div))});vBase(v)}
-        catch(ex){div.querySelector(".err").textContent=ex.message}});
-    });
-    wrap.appendChild(c);
-  }
-  const wineForm=`<label>名字</label><input class="f-name" placeholder="如:拉菲">
-     <div class="grid3"><div><label>种类</label><input class="f-cat" placeholder="红葡萄酒"></div>
-     <div><label>年份</label><input class="f-vin" placeholder="2018"></div>
-     <div><label>原产地</label><input class="f-org" placeholder="法国波尔多"></div></div>
-     <label>备注</label><input class="f-note">`;
-  const wineBody=c=>({type:"酒",name:c.querySelector(".f-name").value,category:c.querySelector(".f-cat").value,vintage:c.querySelector(".f-vin").value,origin:c.querySelector(".f-org").value,note:c.querySelector(".f-note").value});
-  const wineFill=(c,p)=>{c.querySelector(".f-name").value=p.name;c.querySelector(".f-cat").value=p.category||"";c.querySelector(".f-vin").value=p.vintage||"";c.querySelector(".f-org").value=p.origin||"";c.querySelector(".f-note").value=p.note||""};
-  const wineFmt=p=>`<div class="line"><b>${esc(p.name)}</b> <button class="btn sm sec" data-edit="${p.id}">修改</button><div class="small">${[p.category,p.vintage,p.origin,p.note].filter(Boolean).map(esc).join(" · ")}</div><div id="edit-products-${p.id}" style="display:none"></div></div>`;
-  const accForm=`<label>名字</label><input class="f-name" placeholder="如:礼品袋 / 开瓶器"><label>备注</label><input class="f-note">`;
-  const accBody=c=>({type:"附件",name:c.querySelector(".f-name").value,category:"",vintage:"",origin:"",note:c.querySelector(".f-note").value});
-  const accFill=(c,p)=>{c.querySelector(".f-name").value=p.name;c.querySelector(".f-note").value=p.note||""};
-  const accFmt=p=>`<div class="line"><b>${esc(p.name)}</b> <button class="btn sm sec" data-edit="${p.id}">修改</button>${p.note?`<div class="small">${esc(p.note)}</div>`:""}<div id="edit-products-${p.id}" style="display:none"></div></div>`;
-  if(BASE_SUB==="wine")section("红酒清单",DATA.products.filter(p=>p.type==="酒"),wineForm,wineBody,"/api/products",wineFmt,wineFill,true);
-  else if(BASE_SUB==="acc")section("附件清单",DATA.products.filter(p=>p.type==="附件"),accForm,accBody,"/api/products",accFmt,accFill,true);
-  const partyForm=`<div class="grid2"><div><label>姓名</label><input class="f-name"></div><div><label>电话</label><input class="f-phone"></div></div><label>备注</label><input class="f-note">`;
-  const partyBody=c=>({name:c.querySelector(".f-name").value,phone:c.querySelector(".f-phone").value,note:c.querySelector(".f-note").value});
-  const partyFill=(c,p)=>{c.querySelector(".f-name").value=p.name;c.querySelector(".f-phone").value=p.phone||"";c.querySelector(".f-note").value=p.note||""};
-  const partyFmt=(kind)=>p=>`<div class="line"><b>${esc(p.name)}</b> <button class="btn sm sec" data-edit="${p.id}">修改</button><div class="small">${[p.phone,p.note].filter(Boolean).map(esc).join(" · ")}</div><div id="edit-${kind}-${p.id}" style="display:none"></div></div>`;
-  if(BASE_SUB==="sup")section("供应商",DATA.suppliers,partyForm,partyBody,"/api/suppliers",partyFmt("suppliers"),partyFill);
-  const custForm=`<div class="grid2"><div><label>姓名</label><input class="f-name"></div><div><label>电话</label><input class="f-phone"></div></div><label>地址</label><input class="f-address"><label>备注</label><input class="f-note">`;
-  const custBody=c=>({name:c.querySelector(".f-name").value,phone:c.querySelector(".f-phone").value,address:c.querySelector(".f-address").value,note:c.querySelector(".f-note").value});
-  const custFill=(c,p)=>{c.querySelector(".f-name").value=p.name;c.querySelector(".f-phone").value=p.phone||"";c.querySelector(".f-address").value=p.address||"";c.querySelector(".f-note").value=p.note||""};
-  const custFmt=p=>`<div class="line"><b>${esc(p.name)}</b> <button class="btn sm sec" data-edit="${p.id}">修改</button><div class="small">${[p.phone,p.address,p.note].filter(Boolean).map(esc).join(" · ")}</div><div id="edit-customers-${p.id}" style="display:none"></div></div>`;
-  if(BASE_SUB==="cust")section("客户",DATA.customers,custForm,custBody,"/api/customers",custFmt,custFill);
-  const whForm=`<label>名字</label><input class="f-name" placeholder="如:主仓 / 家里酒柜"><label>备注</label><input class="f-note">`;
-  if(BASE_SUB==="wh")section("仓库",DATA.warehouses,whForm,c=>({name:c.querySelector(".f-name").value,note:c.querySelector(".f-note").value}),"/api/warehouses",
-    w=>`<div class="line"><b>${esc(w.name)}</b> <button class="btn sm sec" data-edit="${w.id}">修改</button>${w.note?`<div class="small">${esc(w.note)}</div>`:""}<div id="edit-warehouses-${w.id}" style="display:none"></div></div>`,
-    (c,w)=>{c.querySelector(".f-name").value=w.name;c.querySelector(".f-note").value=w.note||""});
-  v.replaceChildren(wrap);
-}
-
-/* ---------------- 设置 ---------------- */
-async function vSet(v){
-  const c=el("div","card",`<b>设置</b>
-    <label>原密码</label><input id="s-old" type="password">
-    <label>新密码(至少6位)</label><input id="s-new" type="password">
-    <div style="margin-top:10px"><button class="btn" id="s-pw">改密码</button>
-    <button class="btn sec" id="s-bk">立即备份</button></div>
-    <label style="margin-top:14px">开放注册(新账号注册后为管理员)</label>
-    <select id="s-reg"><option value="0">关闭</option><option value="1">开放</option></select>
-    <div style="margin-top:8px"><button class="btn sec" id="s-reg-btn">保存注册开关</button></div>
-    <div class="ok" id="s-ok"></div><div class="err" id="s-err"></div>
-    <div class="small" style="margin-top:10px">备份文件保存在服务器 data/backups/ 目录。</div>`);
-  const logCard=el("div","card",`<b>修改记录</b><div class="small">所有修改的改前/改后留痕</div>
-    <div style="margin-top:8px"><button class="btn sec" id="s-log-btn">查看修改记录</button></div>
-    <div id="s-log-body"></div>`);
-  v.replaceChildren(c,logCard);
-  logCard.querySelector("#s-log-btn").onclick=e=>busy(e.target,async()=>{
-    const body=logCard.querySelector("#s-log-body");
-    body.innerHTML='<div class="loading">加载中…</div>';
-    try{
-      const rows=await api("/api/edit-logs");
-      const names={product:"商品",supplier:"供应商",customer:"客户",warehouse:"仓库",purchase_order:"入库单",sales_order:"货单",transfer:"调拨单",payment:"付款记录"};
-      body.innerHTML=rows.length?rows.map(r=>`<div class="line"><div class="row"><b>${esc(names[r.entity_type]||r.entity_type)} #${r.entity_id}</b><span class="small">${esc(r.created_at.slice(0,16).replace("T"," "))} · ${esc(r.operator||"")}</span></div>
-        <details><summary class="small">改前 / 改后</summary><div class="small" style="white-space:pre-wrap;word-break:break-all">改前:${esc(r.before_json)}\n改后:${esc(r.after_json)}</div></details></div>`).join(""):'<div class="small" style="margin-top:8px">暂无修改记录</div>';
-    }catch(ex){body.innerHTML=`<div class="err">${esc(ex.message)}</div>`}
-  });
-  c.querySelector("#s-pw").onclick=e=>busy(e.target,async()=>{
-    c.querySelector("#s-err").textContent="";
-    try{await api("/api/change-password",{method:"POST",body:JSON.stringify({old_password:c.querySelector("#s-old").value,new_password:c.querySelector("#s-new").value})});
-      c.querySelector("#s-ok").textContent="密码已修改";}catch(ex){c.querySelector("#s-err").textContent=ex.message}});
-  c.querySelector("#s-bk").onclick=e=>busy(e.target,async()=>{
-    c.querySelector("#s-err").textContent="";
-    try{const r=await api("/api/backup",{method:"POST",body:"{}"});
-      c.querySelector("#s-ok").textContent="备份完成:"+r.file;}catch(ex){c.querySelector("#s-err").textContent=ex.message}});
-  try{const me=await api("/api/me");c.querySelector("#s-reg").value=me.registration_open?"1":"0"}catch(e){}
-  c.querySelector("#s-reg-btn").onclick=e=>busy(e.target,async()=>{
-    c.querySelector("#s-err").textContent="";
-    try{await api("/api/settings/registration",{method:"POST",body:JSON.stringify({open:c.querySelector("#s-reg").value==="1"})});
-      c.querySelector("#s-ok").textContent="注册开关已保存";}catch(ex){c.querySelector("#s-err").textContent=ex.message}});
-}
-
-/* ---------------- 启动 ---------------- */
-const VIEWS={stock:vStock,in:vIn,orders:vOrders,transfer:vTransfer,pay:vPay,base:vBase,set:vSet};
-let cur="stock";
-function go(t){cur=t;document.querySelectorAll("#tabs button").forEach(b=>b.classList.toggle("on",b.dataset.t===t));VIEWS[t]($("#view"))}
-document.querySelectorAll("#tabs button").forEach(b=>b.onclick=()=>go(b.dataset.t));
-$("#logout").onclick=async e=>{e.preventDefault();await api("/api/logout",{method:"POST",body:"{}"});location.reload()};
-$("#li-btn").onclick=e=>busy(e.target,async()=>{
-  $("#li-err").textContent="";
-  try{await api("/api/login",{method:"POST",body:JSON.stringify({username:$("#li-user").value,password:$("#li-pass").value})});boot()}
-  catch(ex){$("#li-err").textContent=ex.message}});
-$("#li-pass").addEventListener("keydown",e=>{if(e.key==="Enter")$("#li-btn").click()});
-$("#li-reg-btn").onclick=e=>busy(e.target,async()=>{
-  $("#li-err").textContent="";
-  try{await api("/api/register",{method:"POST",body:JSON.stringify({username:$("#li-user").value,password:$("#li-pass").value})});
-    await api("/api/login",{method:"POST",body:JSON.stringify({username:$("#li-user").value,password:$("#li-pass").value})});boot()}
-  catch(ex){$("#li-err").textContent=ex.message}});
-async function boot(){
-  const me=await api("/api/me");
-  $("#ver").textContent=me.version||"";
-  if(!me.logged_in){
-    $("#login").style.display="flex";$("#main").style.display="none";
-    try{const rs=await api("/api/registration-status");
-      $("#li-reg").style.display=rs.open?"block":"none";
-      $("#li-sub").textContent=rs.has_users?"请登录":"首次使用:请注册管理员账号";
-    }catch(e){}
-    return}
-  $("#login").style.display="none";$("#main").style.display="block";
-  $("#uname").textContent=me.username;
-  go("stock");
-}
-boot();
-</script>
-</body>
-</html>
+const $=id=>document.getElementById(id);
+let token=localStorage.getItem('vr_token')||'';
+let me=localStorage.getItem('vr_user')||'';
+function headers(){return {'Content-Type':'application/json','Authorization':'Bearer '+token}}
+async function api(path,method='GET',body){const r=await fetch(path,{method,headers:headers(),body:body?JSON.stringify(body):undefined});if(r.status===401){logout();throw new Error('未登录')}const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||('请求失败 '+r.status));return d}
+function show(p){['home','wines','suppliers','customers','inbound','opening','outbound','transfer','orders','users','audit'].forEach(x=>$('page-'+x).classList.toggle('hidden',x!==p));if(p==='home')loadHome();if(p==='wines')loadWines();if(p==='suppliers')loadParties('suppliers');if(p==='customers')loadParties('customers');if(p==='users')loadUsers();if(p==='audit')loadAudit();if(['inbound','opening','outbound','transfer'].includes(p))loadFormOptions();}
+async function doLogin(){try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('login-user').value,password:$('login-pw').value})});const d=await r.json();if(!r.ok)throw new Error(d.detail);token=d.token;me=d.username;localStorage.setItem('vr_token',token);localStorage.setItem('vr_user',me);if(d.must_change_password){$('page-login').classList.add('hidden');$('page-chpw').classList.remove('hidden');}else enterApp();}catch(e){alert(e.message)}}
+async function doChangePw(){try{await fetch('/api/change-password',{method:'POST',headers:headers(),body:JSON.stringify({old_password:$('old-pw').value,new_password:$('new-pw').value})}).then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.detail)});$('page-chpw').classList.add('hidden');enterApp();}catch(e){alert(e.message)}}
+function enterApp(){$('page-login').classList.add('hidden');$('page-chpw').classList.add('hidden');$('app').classList.remove('hidden');$('logoutBtn').classList.remove('hidden');$('who').textContent=me;show('home');}
+function logout(){token='';localStorage.removeItem('vr_token');localStorage.removeItem('vr_user');location.reload();}
+async function loadHome(){const d=await api('/api/dashboard');$('stats').innerHTML=`<div class="stat"><span>今天销售额</span><b>¥${d.today_sales}</b></div><div class="stat"><span>今天毛利估算</span><b>¥${d.today_profit}</b></div><div class="stat"><span>客户欠款合计</span><b>¥${d.customer_debt}</b></div><div class="stat"><span>供应商欠款合计</span><b>¥${d.supplier_debt}</b></div><div class="stat"><span>本月自饮</span><b>${d.month_personal_qty} 瓶 / ¥${d.month_personal_cost}</b></div><div class="stat"><span>本月赠送</span><b>${d.month_gift_qty} 瓶 / ¥${d.month_gift_cost}</b></div><div class="stat"><span>本月破损</span><b>${d.month_damage_qty} 瓶 / ¥${d.month_damage_cost}</b></div><div class="stat"><span>本月折扣</span><b>¥${d.month_discount_total}</b></div>`;$('lowstock').innerHTML=d.low_stock.length?d.low_stock.map(w=>`<div>${w.name} ${w.spec||''}：仅剩 ${w.qty} 瓶 <span class="badge warn">低库存</span></div>`).join(''):'暂无低库存酒';}
+async function loadWines(){const ws=await api('/api/wines');$('wine-list').innerHTML=ws.map(w=>`<div class="item">${w.image_path?`<img src="/${w.image_path}">`:'<div style="width:64px;height:64px;background:#eee;border-radius:8px"></div>'}<div><b>${w.name}</b> <span class="muted">${w.spec||''} ${w.brand||''}</span><br><span class="muted">条码 ${w.barcode||'-'} · 库存合计 ${w.stock_total} 瓶</span><br><span class="muted">${w.description||''}</span></div></div>`).join('')||'暂无酒';}
+async function lookupBarcode(){const code=$('w-barcode').value.trim();if(!code)return alert('先填条码');const d=await api('/api/barcode?code='+encodeURIComponent(code));if(!d.found){$('w-msg').textContent='网上查不到，请手填一次存本地库，下次直接用。';return}if(d.source==='local'){$('w-msg').textContent='本地库已有该条码，已自动填入。';}$('w-name').value=d.name||'';$('w-brand').value=d.brand||'';$('w-spec').value=d.spec||'';$('w-origin').value=d.origin||'';$('w-manu').value=d.manufacturer||'';$('w-msg').textContent='已自动带回信息，请核对后保存。';}
+async function saveWine(){const b={barcode:$('w-barcode').value.trim()||null,name:$('w-name').value.trim(),brand:$('w-brand').value,spec:$('w-spec').value,origin:$('w-origin').value,manufacturer:$('w-manu').value,description:$('w-desc').value};const d=await api('/api/wines','POST',b);const f=$('w-img').files[0];if(f){await fetch(`/api/wines/${d.id}/image`,{method:'POST',headers:{'Authorization':'Bearer '+token,'X-Filename':f.name},body:f});}$('w-msg').textContent='已保存';loadWines();}
+async function loadParties(kind){const ps=await api('/api/'+kind);const el=kind==='suppliers'?$('sup-list'):$('cus-list');el.innerHTML=ps.map(p=>`<div class="item"><div><b>${p.name}</b> <span class="muted">${p.contact||''} ${p.phone||''}</span><br>欠款余额 ¥${p.balance}${kind==='customers'&&p.gift_qty?` · 累计获赠 ${p.gift_qty} 瓶（成本 ¥${p.gift_cost}）`:''} ${p.active?'':'<span class="badge warn">已停用</span>'} ${p.active?`<button class="ghost" onclick="toggleParty('${kind}',${p.id},0)">停用</button>`:''}</div></div>`).join('')||'暂无';}
+async function toggleParty(kind,id,active){await api(`/api/${kind}/${id}`,'PUT',{active});loadParties(kind);}
+async function saveParty(kind){const p=kind==='suppliers'?{name:$('s-name').value,contact:$('s-contact').value,phone:$('s-phone').value,address:$('s-addr').value}:{name:$('c-name').value,contact:$('c-contact').value,phone:$('c-phone').value,address:$('c-addr').value};await api('/api/'+kind,'POST',p);loadParties(kind);}
+async function loadFormOptions(){const [wh,wines,sups,cuss]=await Promise.all([api('/api/warehouses'),api('/api/wines'),api('/api/suppliers'),api('/api/customers')]);const whO=wh.map(w=>`<option value="${w.id}">${w.name}</option>`).join('');const wO=wines.map(w=>`<option value="${w.id}">${w.name} ${w.spec||''}（库存${w.stock_total}）</option>`).join('');['in-wh','op-wh','out-wh','tr-from','tr-to'].forEach(id=>$(id).innerHTML=whO);['in-wine','op-wine','out-wine','tr-wine'].forEach(id=>$(id).innerHTML=wO);$('in-sup').innerHTML=sups.filter(s=>s.active).map(s=>`<option value="${s.id}">${s.name}</option>`).join('');$('out-cus').innerHTML=cuss.filter(s=>s.active).map(s=>`<option value="${s.id}">${s.name}</option>`).join('');}
+async function submitInbound(){try{const d=await api('/api/inbound','POST',{type:'purchase',supplier_id:+$('in-sup').value,warehouse_id:+$('in-wh').value,carrier:$('in-carrier').value,tracking_no:$('in-track').value,freight:+$('in-freight').value||0,freight_free:$('in-free').checked,freight_payer:$('in-payer').value,paid_amount:+$('in-paid').value||0,note:$('in-note').value,items:[{wine_id:+$('in-wine').value,qty:+$('in-qty').value,unit_price:+$('in-price').value||0}]});$('in-msg').textContent='已生成进货单 '+d.order_no;}catch(e){$('in-msg').textContent='失败：'+e.message}}
+async function submitOpening(){try{const d=await api('/api/inbound','POST',{type:'opening',warehouse_id:+$('op-wh').value,order_date:$('op-date').value||undefined,batch:$('op-batch').value,paid_amount:0,note:$('op-note').value,items:[{wine_id:+$('op-wine').value,qty:+$('op-qty').value,unit_price:+$('op-price').value||0,batch:$('op-batch').value}]});$('op-msg').textContent='已生成补登单 '+d.order_no;}catch(e){$('op-msg').textContent='失败：'+e.message}}
+function outTypeChanged(){const t=$('out-type').value;$('out-discount').classList.toggle('hidden',t!=='sale');}
+async function submitOutbound(){try{const typ=$('out-type').value;const rate=$('out-rate').value.trim(),dprice=$('out-dprice').value.trim(),reason=$('out-reason').value.trim();if(typ==='gift'&&!$('out-cus').value)throw new Error('赠送必须选择客户');if(typ==='sale'&&(rate||dprice)&&!reason&&!$('out-note').value.trim())throw new Error('打折需填写瑕疵/打折原因');const item={wine_id:+$('out-wine').value,qty:+$('out-qty').value,unit_price:+$('out-price').value||0};if(typ==='sale'){item.orig_price=item.unit_price;if(rate)item.discount_rate=+rate;if(dprice)item.discount_price=+dprice;if(reason)item.reason=reason;}const d=await api('/api/outbound','POST',{type:typ,customer_id:(typ==='sale'||typ==='gift')?+$('out-cus').value:undefined,warehouse_id:+$('out-wh').value,order_date:$('out-date').value||undefined,carrier:$('out-carrier').value,tracking_no:$('out-track').value,freight:+$('out-freight').value||0,freight_free:$('out-free').checked,freight_payer:$('out-payer').value,paid_amount:+$('out-paid').value||0,note:$('out-note').value,items:[item]});$('out-msg').textContent='已生成单据 '+d.order_no+(d.discount_total?'（折扣 ¥'+d.discount_total+'）':'');}catch(e){$('out-msg').textContent='失败：'+e.message}}
+async function submitTransfer(){try{const d=await api('/api/transfers','POST',{wine_id:+$('tr-wine').value,from_warehouse_id:+$('tr-from').value,to_warehouse_id:+$('tr-to').value,qty:+$('tr-qty').value});$('tr-msg').textContent='调拨完成 '+d.transfer_no;}catch(e){$('tr-msg').textContent='失败：'+e.message}}
+async function loadOrders(kind){let ds;if(kind==='transfers')ds=await api('/api/transfers');else ds=await api('/api/'+kind);$('order-list').innerHTML=ds.map(o=>{const no=o.order_no||o.transfer_no;const tot=o.sale_total??o.goods_total??'';const tlabel=o.type==='personal'?'自饮':o.type==='gift'?'赠送':o.type==='damage'?'破损':o.type==='opening'?'补登':'';const canShare=kind==='inbound'||o.type==='sale';return `<div class="item"><div><b>${no}</b> <span class="muted">${o.order_date||o.created_at||''} ${tlabel}</span><br>金额 ¥${tot} · 已付 ¥${o.paid_amount??''} · ${o.pay_status||''} ${kind!=='transfers'?`<button class="ghost" onclick="showOrder('${kind}',${o.id})">详情/补记付款</button> ${canShare?`<a href="/api/orders/${kind==='inbound'?'inbound':'outbound'}/${o.id}/share.png" target="_blank"><button class="ghost">分享图</button></a>`:''}`:''}</div></div>`}).join('')||'暂无单据';}
+async function showOrder(kind,id){const d=await api(`/api/${kind}/${id}`);const tot=d.sale_total??d.goods_total;const canShare=kind==='inbound'||d.type==='sale';const canPay=kind==='inbound'||d.type==='sale';const tlabel=d.type==='personal'?'自饮':d.type==='gift'?'赠送':d.type==='damage'?'破损':'';$('order-detail').innerHTML=`<div class="card"><h3>${d.order_no} ${tlabel}</h3><div>${d.items.map(i=>`${i.wine_name} x${i.qty} `+(i.discount_amount?`原价${i.orig_price} 折后${i.unit_price} 折扣${i.discount_amount} 小计${(i.qty*i.unit_price).toFixed(2)}`:`单价${i.unit_price} 小计${(i.qty*i.unit_price).toFixed(2)}`)).join('<br>')}</div><p>${d.type&&d.type!=='sale'?`成本 ¥${d.cost_total||0}（${d.items.reduce((a,i)=>a+i.qty,0)} 瓶）`:`货款 ¥${tot}${d.discount_total?`（其中折扣 ¥${d.discount_total}）`:''}`} · 运费 ¥${d.freight} · 已付 ¥${d.paid_amount} · 状态 ${d.pay_status}</p>${canPay?`<label>补记金额（元）</label><input id="pay-amt" type="number" step="0.01"><button onclick="addPay('${kind}',${id})">补记</button> `:''}${canShare?`<a href="/api/orders/${kind}/${id}/share.png" target="_blank"><button class="ghost">生成分享图</button></a>`:''}</div>`;}
+async function addPay(kind,id){const amt=+$('pay-amt').value;await api(`/api/orders/${kind}/${id}/payments`,'POST',{amount:amt});showOrder(kind,id);loadOrders(kind);}
+async function loadUsers(){const us=await api('/api/users');$('user-list').innerHTML=us.map(x=>`<div class="item"><div><b>${x.username}</b> ${x.display_name||''} ${x.active?'':'<span class="badge warn">已停用</span>'} ${x.must_change_password?'<span class="badge warn">需改密</span>':''} ${x.active?`<button class="ghost" onclick="toggleUser(${x.id},0)">停用</button>`:''}</div></div>`).join('');}
+async function toggleUser(id,active){await api(`/api/users/${id}`,'PUT',{active});loadUsers();}
+async function saveUser(){await api('/api/users','POST',{username:$('u-name').value,display_name:$('u-disp').value,password:$('u-pw').value,must_change_password:true});loadUsers();}
+async function loadAudit(){const ls=await api('/api/audit-logs');$('audit-list').innerHTML=ls.map(l=>`<div>${l.created_at} <b>${l.username}</b> ${l.action} ${l.target||''} <span class="muted">${l.note||''}</span></div>`).join('')||'暂无记录';}
+async function loadVersion(){try{const r=await fetch('/api/version');const d=await r.json();if(d.version){$('ver').textContent=d.version;const lv=$('login-ver');if(lv)lv.textContent=d.version;}}catch(e){}}
+loadVersion();
+if(token){$('page-login').classList.add('hidden');enterApp();}else{$('page-login').classList.remove('hidden');}
+</script></body></html>

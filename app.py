@@ -1,1716 +1,1097 @@
-#!/usr/bin/env python3
-"""红酒进销存: FastAPI + SQLite(WAL).
-
-v0.3.0: 档案、采购入库(含运费分摊/期初库存/入库付款状态)、批次库存+流水、
-多仓调拨、应付与付款、客户货单(预定/发货扣库存/取消留痕/公开单页)、
-注册与管理员; 已录入信息可更改(档案/货单/入库单/调拨/付款, 带逻辑把关与修改留痕)。
-拍照扫码/直发/退货为后续版本。
-金额一律整数分存储; 库存以流水为据、余额表为缓存; 单据带幂等键防重复提交。
-老库兼容: 启动时只做 CREATE TABLE IF NOT EXISTS + 检测后 ALTER ADD COLUMN(带默认值),
-绝不删列/改列类型, 老数据与老管理员账号原样保留。
-"""
+"""vin-rouge v2: 酒类分销进销存 (FastAPI + SQLite, 单文件)."""
 import hashlib
 import json
 import os
 import secrets
+import subprocess
 import sqlite3
-import time
-from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+import urllib.request
+import urllib.error
+from datetime import datetime, timedelta, date
+from io import BytesIO
 from pathlib import Path
-from typing import Optional
 
-from fastapi import Cookie, FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel
+from fastapi import FastAPI, Request, UploadFile, File, Form
+from fastapi.responses import JSONResponse, FileResponse, Response
+from fastapi.staticfiles import StaticFiles
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("WINE_DATA_DIR", BASE_DIR / "data"))
-DB_PATH = Path(os.environ.get("WINE_DB_PATH", DATA_DIR / "wine.db"))
-STATIC_DIR = BASE_DIR / "static"
-APP_VERSION = "v0.4.0"
-SESSION_DAYS = 30
-ADMIN_USER = os.environ.get("WINE_ADMIN_USER", "allen314")
-# 不写死密码: 优先环境变量 WINE_ADMIN_PASSWORD; 未设时首次启动随机生成,
-# 打印到启动日志并写到 data/INITIAL_PASSWORD.txt(该目录被 .gitignore 排除),
-# 登录后请立即在「设置」里改密码并删除该文件。
-ADMIN_PASS = os.environ.get("WINE_ADMIN_PASSWORD", "").strip()
-
-app = FastAPI(title="红酒进销存·入库MVP")
+DB_PATH = Path(os.environ.get("VIN_ROUGE_DB", str(BASE_DIR / "vin_rouge.db")))
+UPLOAD_DIR = BASE_DIR / "uploads"
+UPLOAD_DIR.mkdir(exist_ok=True)
+LOW_STOCK_THRESHOLD = 5
+TOKEN_TTL_HOURS = 24
 
 
-# ---------------------------------------------------------------- DB
-def connect():
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
+# ---------- 版本（单点管理） ----------
+# 唯一版本源：只改 APP_VERSION，全仓同步
+# （前端页脚、README、/api/version、/api/config 都以它为准，不要在别处手写版本号）。
+APP_VERSION = "v2.0.0"
+BUILD_DATE = "2026-11-25"
 
 
-@contextmanager
-def db():
-    conn = connect()
+def _git_commit():
     try:
-        yield conn
-        conn.commit()
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], cwd=str(BASE_DIR),
+            stderr=subprocess.DEVNULL, timeout=3).decode().strip()
     except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
+        return ""
+
+app = FastAPI(title="vin-rouge v2", version=APP_VERSION)
 
 
-def now_iso():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def hash_pw(password: str, salt: str) -> str:
-    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 120_000).hex()
-
-
-def _add_column(c, table, col, ddl):
-    """老库兼容迁移: 列不存在才 ADD COLUMN(带默认值), 绝不删列/改类型。"""
-    cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})")]
-    if col not in cols:
-        c.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
+# ---------- DB ----------
+def conn():
+    c = sqlite3.connect(str(DB_PATH))
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")
+    return c
 
 
 def init_db():
-    with db() as c:
-        # 先记录老库状态(老库升级时 users 表已存在), 供管理员兼容逻辑判断
-        had_users_table = bool(c.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='users'").fetchone())
-        c.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS users(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT UNIQUE NOT NULL,
-                pw_hash TEXT NOT NULL, salt TEXT NOT NULL,
-                created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS sessions(
-                token TEXT PRIMARY KEY, user_id INTEGER NOT NULL,
-                expires_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS products(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                type TEXT NOT NULL DEFAULT '酒',
-                name TEXT NOT NULL, category TEXT DEFAULT '',
-                vintage TEXT DEFAULT '', origin TEXT DEFAULT '',
-                note TEXT DEFAULT '', created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS suppliers(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL, contact TEXT DEFAULT '',
-                phone TEXT DEFAULT '', note TEXT DEFAULT '',
-                created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS customers(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL, contact TEXT DEFAULT '',
-                phone TEXT DEFAULT '', note TEXT DEFAULT '',
-                created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS warehouses(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL, note TEXT DEFAULT '',
-                created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS purchase_orders(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_no TEXT UNIQUE NOT NULL,
-                type TEXT NOT NULL DEFAULT '采购入库',
-                supplier_id INTEGER, warehouse_id INTEGER NOT NULL,
-                biz_date TEXT NOT NULL,
-                freight_cents INTEGER NOT NULL DEFAULT 0,
-                goods_cents INTEGER NOT NULL DEFAULT 0,
-                total_cents INTEGER NOT NULL DEFAULT 0,
-                status TEXT NOT NULL DEFAULT '已确认',
-                idempotency_key TEXT UNIQUE,
-                note TEXT DEFAULT '', created_by TEXT DEFAULT '',
-                created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS purchase_lines(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
-                qty INTEGER NOT NULL, unit_price_cents INTEGER NOT NULL,
-                line_total_cents INTEGER NOT NULL,
-                freight_share_cents INTEGER NOT NULL DEFAULT 0,
-                batch_id INTEGER);
-            CREATE TABLE IF NOT EXISTS batches(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                product_id INTEGER NOT NULL, supplier_id INTEGER,
-                purchase_line_id INTEGER,
-                qty_initial INTEGER NOT NULL,
-                unit_price_cents INTEGER NOT NULL,
-                total_cost_cents INTEGER NOT NULL,
-                biz_date TEXT NOT NULL, created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS inventory_balances(
-                batch_id INTEGER NOT NULL, warehouse_id INTEGER NOT NULL,
-                qty INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY(batch_id, warehouse_id));
-            CREATE TABLE IF NOT EXISTS inventory_txns(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                txn_type TEXT NOT NULL, product_id INTEGER NOT NULL,
-                batch_id INTEGER, warehouse_id INTEGER,
-                qty_delta INTEGER NOT NULL,
-                ref_type TEXT DEFAULT '', ref_id INTEGER,
-                note TEXT DEFAULT '', created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS payables(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                supplier_id INTEGER NOT NULL,
-                purchase_order_id INTEGER UNIQUE NOT NULL,
-                amount_cents INTEGER NOT NULL,
-                paid_cents INTEGER NOT NULL DEFAULT 0,
-                biz_date TEXT NOT NULL, created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS payments(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                payable_id INTEGER NOT NULL, supplier_id INTEGER NOT NULL,
-                amount_cents INTEGER NOT NULL, pay_date TEXT NOT NULL,
-                note TEXT DEFAULT '', created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS transfers(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                transfer_no TEXT UNIQUE NOT NULL,
-                from_warehouse_id INTEGER NOT NULL,
-                to_warehouse_id INTEGER NOT NULL,
-                biz_date TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT '已确认',
-                idempotency_key TEXT UNIQUE,
-                note TEXT DEFAULT '', created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS transfer_lines(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                transfer_id INTEGER NOT NULL, batch_id INTEGER NOT NULL,
-                product_id INTEGER NOT NULL, qty INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS settings(
-                key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');
-            CREATE TABLE IF NOT EXISTS sales_orders(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_no TEXT UNIQUE NOT NULL,
-                customer_id INTEGER NOT NULL, warehouse_id INTEGER NOT NULL,
-                biz_date TEXT NOT NULL DEFAULT '',
-                freight_cents INTEGER NOT NULL DEFAULT 0,
-                freight_payer TEXT NOT NULL DEFAULT '客户付',
-                goods_cents INTEGER NOT NULL DEFAULT 0,
-                total_cents INTEGER NOT NULL DEFAULT 0,
-                order_status TEXT NOT NULL DEFAULT '正常',
-                ship_status TEXT NOT NULL DEFAULT '未发货',
-                pay_status TEXT NOT NULL DEFAULT '未付款',
-                pay_time TEXT, ship_time TEXT,
-                logistics_no TEXT DEFAULT '',
-                public_token TEXT UNIQUE,
-                idempotency_key TEXT UNIQUE,
-                note TEXT DEFAULT '', cancel_reason TEXT DEFAULT '',
-                cancelled_at TEXT, created_by TEXT DEFAULT '',
-                created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS sales_lines(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
-                qty INTEGER NOT NULL, unit_price_cents INTEGER NOT NULL DEFAULT 0,
-                line_type TEXT NOT NULL DEFAULT '销售',
-                line_total_cents INTEGER NOT NULL DEFAULT 0);
-            CREATE TABLE IF NOT EXISTS sales_allocations(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id INTEGER NOT NULL, line_id INTEGER NOT NULL,
-                batch_id INTEGER NOT NULL, qty INTEGER NOT NULL,
-                cost_cents INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS sales_order_events(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                order_id INTEGER NOT NULL, event TEXT NOT NULL,
-                detail TEXT DEFAULT '', created_at TEXT NOT NULL);
-            CREATE TABLE IF NOT EXISTS edit_logs(
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                entity_type TEXT NOT NULL, entity_id INTEGER NOT NULL,
-                before_json TEXT NOT NULL DEFAULT '{}',
-                after_json TEXT NOT NULL DEFAULT '{}',
-                operator TEXT DEFAULT '', created_at TEXT NOT NULL);
-            """
-        )
-        # ---- 老库兼容迁移: 只加列(带默认值), 不删列/不改类型 ----
-        _add_column(c, "users", "role", "role TEXT NOT NULL DEFAULT 'admin'")
-        _add_column(c, "purchase_orders", "pay_status", "pay_status TEXT NOT NULL DEFAULT '未付款'")
-        _add_column(c, "customers", "address", "address TEXT DEFAULT ''")
-        # 管理员兼容: 老库(已有 users 表)或设了 WINE_ADMIN_PASSWORD 时, 沿用老逻辑
-        # 自动建 allen314(环境变量密码 / INITIAL_PASSWORD.txt), 老管理员绝不登不进去。
-        # 全新库且未设环境变量时不自动建号, 改走注册: 第一个注册者自动管理员。
-        row = c.execute("SELECT id FROM users WHERE username=?", (ADMIN_USER,)).fetchone()
-        user_count = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        _bm = c.execute("SELECT value FROM settings WHERE key='bootstrap_mode'").fetchone()
-        bootstrap_mode = _bm["value"] if _bm else ""
-        # 全新库(无老表、无环境变量密码)走注册模式并记标记, 防止下次启动误建 allen314
-        if not row and user_count == 0 and not ADMIN_PASS and not had_users_table and not bootstrap_mode:
-            c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('bootstrap_mode','register')")
-            bootstrap_mode = "register"
-        if not row and user_count == 0 and bootstrap_mode != "register" and (had_users_table or ADMIN_PASS):
-            pw = ADMIN_PASS or secrets.token_urlsafe(12)
-            salt = secrets.token_hex(8)
-            c.execute(
-                "INSERT INTO users(username,pw_hash,salt,role,created_at) VALUES(?,?,?,?,?)",
-                (ADMIN_USER, hash_pw(pw, salt), salt, "admin", now_iso()),
-            )
-            if not ADMIN_PASS:
-                DATA_DIR.mkdir(parents=True, exist_ok=True)
-                (DATA_DIR / "INITIAL_PASSWORD.txt").write_text(
-                    f"账号: {ADMIN_USER}\n初始密码: {pw}\n登录后请立即改密码并删除本文件。\n",
-                    encoding="utf-8",
-                )
-                print(f"[wine] 首次启动: 管理员 {ADMIN_USER} 初始密码已生成, 见 {DATA_DIR / 'INITIAL_PASSWORD.txt'}", flush=True)
+    with conn() as c:
+        c.executescript("""
+        CREATE TABLE IF NOT EXISTS users(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT UNIQUE NOT NULL,
+          display_name TEXT, password_hash TEXT NOT NULL, active INTEGER DEFAULT 1,
+          must_change_password INTEGER DEFAULT 0, session_token TEXT,
+          session_expires_at TEXT, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS audit_logs(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT, action TEXT,
+          target TEXT, note TEXT, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS wines(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, barcode TEXT UNIQUE, name TEXT NOT NULL,
+          brand TEXT, spec TEXT, capacity_ml INTEGER, abv REAL, origin TEXT,
+          manufacturer TEXT, image_path TEXT, description TEXT,
+          created_at TEXT, updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS warehouses(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, active INTEGER DEFAULT 1);
+        CREATE TABLE IF NOT EXISTS suppliers(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, contact TEXT,
+          phone TEXT, address TEXT, note TEXT, active INTEGER DEFAULT 1);
+        CREATE TABLE IF NOT EXISTS customers(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, contact TEXT,
+          phone TEXT, address TEXT, note TEXT, active INTEGER DEFAULT 1);
+        CREATE TABLE IF NOT EXISTS stock(
+          warehouse_id INTEGER, wine_id INTEGER, batch TEXT DEFAULT '',
+          quantity INTEGER DEFAULT 0,
+          PRIMARY KEY(warehouse_id, wine_id, batch));
+        CREATE TABLE IF NOT EXISTS inbound_orders(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, order_no TEXT UNIQUE NOT NULL,
+          type TEXT NOT NULL, supplier_id INTEGER, warehouse_id INTEGER,
+          order_date TEXT, carrier TEXT, tracking_no TEXT, freight REAL DEFAULT 0,
+          freight_free INTEGER DEFAULT 0, freight_payer TEXT, goods_total REAL DEFAULT 0,
+          pay_status TEXT DEFAULT 'unpaid', note TEXT, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS inbound_items(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER, wine_id INTEGER,
+          batch TEXT DEFAULT '', qty INTEGER, unit_price REAL);
+        CREATE TABLE IF NOT EXISTS outbound_orders(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, order_no TEXT UNIQUE NOT NULL,
+          customer_id INTEGER, warehouse_id INTEGER, order_date TEXT,
+          carrier TEXT, tracking_no TEXT, freight REAL DEFAULT 0,
+          freight_free INTEGER DEFAULT 0, freight_payer TEXT, sale_total REAL DEFAULT 0,
+          type TEXT DEFAULT 'sale', cost_total REAL DEFAULT 0,
+          orig_total REAL DEFAULT 0, discount_total REAL DEFAULT 0,
+          pay_status TEXT DEFAULT 'unpaid', note TEXT, created_at TEXT);
+        CREATE TABLE IF NOT EXISTS outbound_items(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER, wine_id INTEGER,
+          batch TEXT DEFAULT '', qty INTEGER, unit_price REAL, orig_price REAL,
+          discount_rate REAL, discount_amount REAL DEFAULT 0,
+          cost_price REAL DEFAULT 0, reason TEXT);
+        CREATE TABLE IF NOT EXISTS transfers(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, transfer_no TEXT UNIQUE NOT NULL,
+          from_warehouse_id INTEGER, to_warehouse_id INTEGER, wine_id INTEGER,
+          batch TEXT DEFAULT '', qty INTEGER, created_at TEXT, note TEXT);
+        CREATE TABLE IF NOT EXISTS payments(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, order_type TEXT, order_id INTEGER,
+          amount REAL, pay_date TEXT, note TEXT, created_at TEXT);
+        """)
+        # 轻量迁移: 老库补列 (自饮/赠送/破损/折扣新增字段, 已有行 type 默认 sale)
+        for _t, _col, _ddl in (
+                ("outbound_orders", "type", "TEXT DEFAULT 'sale'"),
+                ("outbound_orders", "cost_total", "REAL DEFAULT 0"),
+                ("outbound_orders", "orig_total", "REAL DEFAULT 0"),
+                ("outbound_orders", "discount_total", "REAL DEFAULT 0"),
+                ("outbound_items", "orig_price", "REAL"),
+                ("outbound_items", "discount_rate", "REAL"),
+                ("outbound_items", "discount_amount", "REAL DEFAULT 0"),
+                ("outbound_items", "cost_price", "REAL DEFAULT 0"),
+                ("outbound_items", "reason", "TEXT")):
+            _cols = [r[1] for r in c.execute(f"PRAGMA table_info({_t})")]
+            if _col not in _cols:
+                c.execute(f"ALTER TABLE {_t} ADD COLUMN {_col} {_ddl}")
+        n = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        if n == 0:
+            c.execute("INSERT INTO users(username,display_name,password_hash,"
+                      "must_change_password,created_at) VALUES(?,?,?,?,?)",
+                      ("tristan", "Tristan", hash_pw("vin123456"), 1,
+                       datetime.now().isoformat()))
+            c.execute("INSERT INTO warehouses(name) VALUES('主仓'),('副仓')")
+            c.execute("INSERT INTO suppliers(name,contact,phone,note) VALUES"
+                      "('示例供应商','张经理','13800000000','示例数据')")
+            c.execute("INSERT INTO customers(name,contact,phone,note) VALUES"
+                      "('示例客户','李老板','13900000000','示例数据')")
+            now = datetime.now().isoformat()
+            c.execute("INSERT INTO wines(barcode,name,brand,spec,origin,description,"
+                      "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                      ("6900000000001", "示例红酒 A", "示例品牌", "750ml*6瓶/箱",
+                       "法国", "示例酒，仅用于演示", now, now))
+            c.execute("INSERT INTO wines(barcode,name,brand,spec,origin,description,"
+                      "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                      ("6900000000002", "示例白酒 B", "示例品牌", "500ml*6瓶/箱",
+                       "中国", "示例酒，仅用于演示", now, now))
 
 
-init_db()
+def hash_pw(pw: str) -> str:
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt), 200_000)
+    return f"pbkdf2:{salt}:{dk.hex()}"
 
 
-# ---------------------------------------------------------------- 工具
-def to_cents(yuan) -> int:
+def check_pw(pw: str, h: str) -> bool:
     try:
-        d = Decimal(str(yuan))
-    except (InvalidOperation, ValueError):
-        raise HTTPException(400, "金额格式不对")
-    if d < 0:
-        raise HTTPException(400, "金额不能为负")
-    return int((d * 100).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+        _, salt, dk = h.split(":")
+        return hashlib.pbkdf2_hmac("sha256", pw.encode(), bytes.fromhex(salt),
+                                   200_000).hex() == dk
+    except Exception:
+        return False
 
 
-def yuan(cents) -> float:
-    return round(int(cents) / 100, 2)
+def audit(c, username, action, target="", note=""):
+    c.execute("INSERT INTO audit_logs(username,action,target,note,created_at)"
+              " VALUES(?,?,?,?,?)", (username, action, target, note,
+                                     datetime.now().isoformat()))
 
 
-def current_user(token: Optional[str]):
-    if not token:
+def rowdict(r):
+    return dict(r) if r else None
+
+
+def rows(c, sql, args=()):
+    return [dict(r) for r in c.execute(sql, args)]
+
+
+# ---------- Auth ----------
+async def current_user(request: Request):
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
         return None
-    with db() as c:
-        row = c.execute(
-            "SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id "
-            "WHERE s.token=? AND s.expires_at>?",
-            (token, now_iso()),
-        ).fetchone()
-    return dict(row) if row else None
+    token = auth[7:]
+    with conn() as c:
+        r = c.execute("SELECT * FROM users WHERE session_token=? AND active=1",
+                      (token,)).fetchone()
+        if not r:
+            return None
+        exp = r["session_expires_at"]
+        if exp and datetime.fromisoformat(exp) < datetime.now():
+            return None
+        return dict(r)
 
 
-def require_user(token: Optional[str]):
-    u = current_user(token)
+async def require_user(request: Request):
+    u = await current_user(request)
     if not u:
-        raise HTTPException(401, "未登录")
-    return u
+        return None, JSONResponse({"detail": "未登录"}, status_code=401)
+    if u.get("must_change_password"):
+        return None, JSONResponse({"detail": "请先修改默认密码",
+                                   "must_change_password": True}, status_code=403)
+    return u, None
 
 
-def get_setting(c, key, default=""):
-    r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
-    return r["value"] if r else default
+def err(msg, code=400):
+    return JSONResponse({"detail": msg}, status_code=code)
 
 
-def registration_open(c) -> bool:
-    """注册开关: 管理员显式设置优先; 未设置时默认无用户开、有用户关。"""
-    v = get_setting(c, "registration_open", "")
-    if v in ("1", "0"):
-        return v == "1"
-    return c.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0
+@app.on_event("startup")
+def startup():
+    init_db()
 
 
-def reserved_qty(c, product_id, warehouse_id=None) -> int:
-    """已预定: 正常且未发货货单的明细数量(可按仓库过滤)。"""
-    q = ("SELECT COALESCE(SUM(l.qty),0) FROM sales_lines l "
-         "JOIN sales_orders o ON o.id=l.order_id "
-         "WHERE l.product_id=? AND o.order_status='正常' AND o.ship_status='未发货'")
-    args = [product_id]
-    if warehouse_id is not None:
-        q += " AND o.warehouse_id=?"
-        args.append(warehouse_id)
-    return c.execute(q, args).fetchone()[0]
-
-
-def stock_qty(c, product_id, warehouse_id) -> int:
-    return c.execute(
-        "SELECT COALESCE(SUM(bal.qty),0) FROM inventory_balances bal "
-        "JOIN batches b ON b.id=bal.batch_id WHERE b.product_id=? AND bal.warehouse_id=?",
-        (product_id, warehouse_id)).fetchone()[0]
-
-
-def next_no(c, prefix: str, table: str, col: str) -> str:
-    day = datetime.now().strftime("%Y%m%d")
-    n = c.execute(f"SELECT COUNT(*) FROM {table} WHERE {col} LIKE ?", (f"{prefix}{day}-%",)).fetchone()[0]
-    return f"{prefix}{day}-{n + 1:03d}"
-
-
-def alloc_freight(freight: int, weights: list[int]) -> list[int]:
-    """按权重(行金额, 全为0时按数量)分摊运费(分), 余数逐分补给前面的行。"""
-    if freight <= 0:
-        return [0] * len(weights)
-    total = sum(weights)
-    if total <= 0:
-        weights = [1] * len(weights)
-        total = len(weights)
-    shares = [freight * w // total for w in weights]
-    rest = freight - sum(shares)
-    i = 0
-    while rest > 0:
-        shares[i % len(shares)] += 1
-        rest -= 1
-        i += 1
-    return shares
-
-
-def log_edit(c, entity_type, entity_id, before, after, operator):
-    """修改留痕: 每次成功修改写一条改前/改后 JSON 快照。"""
-    c.execute(
-        "INSERT INTO edit_logs(entity_type,entity_id,before_json,after_json,operator,created_at)"
-        " VALUES(?,?,?,?,?,?)",
-        (entity_type, entity_id,
-         json.dumps(before, ensure_ascii=False, default=str),
-         json.dumps(after, ensure_ascii=False, default=str),
-         operator or "", now_iso()))
-
-
-# ---------------------------------------------------------------- 模型
-class LoginIn(BaseModel):
-    username: str
-    password: str
-
-
-class RegisterIn(BaseModel):
-    username: str
-    password: str
-
-
-class RegistrationSettingIn(BaseModel):
-    open: bool
-
-
-class ChangePwIn(BaseModel):
-    old_password: str
-    new_password: str
-
-
-class ProductIn(BaseModel):
-    type: str = "酒"
-    name: str
-    category: str = ""
-    vintage: str = ""
-    origin: str = ""
-    note: str = ""
-
-
-class PartyIn(BaseModel):
-    name: str
-    contact: str = ""
-    phone: str = ""
-    note: str = ""
-
-
-class CustomerIn(BaseModel):
-    # 客户信息: 姓名/电话/地址/备注(contact 列保留兼容老数据, 不再录入)
-    name: str
-    phone: str = ""
-    address: str = ""
-    note: str = ""
-
-
-class WarehouseIn(BaseModel):
-    name: str
-    note: str = ""
-
-
-class PurchaseLineIn(BaseModel):
-    product_id: int
-    qty: int
-    unit_price: str  # 元, 字符串避免浮点
-
-
-class PurchaseIn(BaseModel):
-    type: str = "采购入库"  # 采购入库 / 期初库存
-    supplier_id: Optional[int] = None
-    warehouse_id: int
-    biz_date: str
-    freight: str = "0"
-    lines: list[PurchaseLineIn]
-    note: str = ""
-    idempotency_key: str = ""
-    pay_status: str = "未付款"  # 已付款 / 未付款(仅采购入库; 已付款=应付立即全额核销)
-
-
-class SalesLineIn(BaseModel):
-    product_id: int
-    qty: int
-    unit_price: str = "0"  # 元; 赠送行强制 0
-    line_type: str = "销售"  # 销售 / 赠送
-
-
-class SalesIn(BaseModel):
-    customer_id: int
-    warehouse_id: int
-    biz_date: str = ""
-    lines: list[SalesLineIn]
-    freight: str = "0"
-    freight_payer: str = "客户付"  # 客户付 / 自提无 / 我方代付
-    pay_status: str = "未付款"  # 已付款(预付) / 未付款
-    logistics_no: str = ""
-    note: str = ""
-    idempotency_key: str = ""
-
-
-class ShipIn(BaseModel):
-    logistics_no: str = ""
-    ship_time: str = ""
-
-
-class PayStatusIn(BaseModel):
-    pay_status: str  # 已付款 / 未付款
-
-
-class CancelIn(BaseModel):
-    reason: str = ""
-
-
-class TransferLineIn(BaseModel):
-    batch_id: int
-    qty: int
-
-
-class TransferIn(BaseModel):
-    from_warehouse_id: int
-    to_warehouse_id: int
-    biz_date: str
-    lines: list[TransferLineIn]
-    note: str = ""
-    idempotency_key: str = ""
-
-
-class PaymentIn(BaseModel):
-    amount: str
-    pay_date: str
-    note: str = ""
-
-
-class PurchaseEditIn(BaseModel):
-    supplier_id: Optional[int] = None
-    warehouse_id: int
-    biz_date: str
-    freight: str = "0"
-    lines: list[PurchaseLineIn]
-    note: str = ""
-    pay_status: str = "未付款"
-
-
-class SalesEditIn(BaseModel):
-    customer_id: int
-    warehouse_id: int
-    biz_date: str = ""
-    lines: list[SalesLineIn]
-    freight: str = "0"
-    freight_payer: str = "客户付"
-    logistics_no: str = ""
-    note: str = ""
-
-
-class TransferEditIn(BaseModel):
-    to_warehouse_id: int
-    biz_date: str
-    lines: list[TransferLineIn]
-    note: str = ""
-
-
-# ---------------------------------------------------------------- 静态/登录
 @app.get("/")
 def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(BASE_DIR / "static" / "index.html")
 
 
+@app.get("/api/version")
+def version_info():
+    return {"version": APP_VERSION, "build_date": BUILD_DATE, "commit": _git_commit()}
+
+
+@app.get("/api/config")
+def config_info():
+    return {"version": APP_VERSION, "build_date": BUILD_DATE,
+            "commit": _git_commit(), "port": int(os.environ.get("PORT", "9000"))}
+
+
+# ---------- 登录 / 用户 ----------
 @app.post("/api/login")
-def login(body: LoginIn, response: Response):
-    with db() as c:
-        row = c.execute("SELECT * FROM users WHERE username=?", (body.username,)).fetchone()
-        if not row or not secrets.compare_digest(hash_pw(body.password, row["salt"]), row["pw_hash"]):
-            raise HTTPException(401, "账号或密码不对")
-        token = secrets.token_urlsafe(32)
-        exp = (datetime.now(timezone.utc) + timedelta(days=SESSION_DAYS)).isoformat(timespec="seconds")
-        c.execute("INSERT INTO sessions(token,user_id,expires_at) VALUES(?,?,?)", (token, row["id"], exp))
-    response.set_cookie("wine_token", token, httponly=True, samesite="lax", max_age=SESSION_DAYS * 86400)
-    return {"ok": True, "username": body.username}
-
-
-@app.post("/api/logout")
-def logout(response: Response, wine_token: Optional[str] = Cookie(default=None)):
-    if wine_token:
-        with db() as c:
-            c.execute("DELETE FROM sessions WHERE token=?", (wine_token,))
-    response.delete_cookie("wine_token")
-    return {"ok": True}
-
-
-@app.get("/api/me")
-def me(wine_token: Optional[str] = Cookie(default=None)):
-    u = current_user(wine_token)
-    with db() as c:
-        reg_open = registration_open(c)
-    return {"logged_in": bool(u), "username": u["username"] if u else None,
-            "role": (u.get("role") or "admin") if u else None,
-            "registration_open": reg_open, "version": APP_VERSION}
-
-
-@app.get("/api/registration-status")
-def registration_status():
-    with db() as c:
-        return {"open": registration_open(c),
-                "has_users": c.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0}
-
-
-@app.post("/api/register")
-def register(body: RegisterIn):
-    username = body.username.strip()
-    if not username:
-        raise HTTPException(400, "用户名不能为空")
-    if len(body.password) < 6:
-        raise HTTPException(400, "密码至少6位")
-    with db() as c:
-        if not registration_open(c):
-            raise HTTPException(403, "注册已关闭")
-        if c.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone():
-            raise HTTPException(400, "用户名已存在")
-        # 本期注册用户角色只做管理员一种(role 字段预留); 第一个注册者自动管理员
-        salt = secrets.token_hex(8)
-        cur = c.execute(
-            "INSERT INTO users(username,pw_hash,salt,role,created_at) VALUES(?,?,?,?,?)",
-            (username, hash_pw(body.password, salt), salt, "admin", now_iso()))
-        return {"ok": True, "id": cur.lastrowid, "username": username, "role": "admin"}
-
-
-@app.post("/api/settings/registration")
-def set_registration(body: RegistrationSettingIn, wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    with db() as c:
-        c.execute("INSERT OR REPLACE INTO settings(key,value) VALUES('registration_open',?)",
-                  ("1" if body.open else "0",))
-    return {"ok": True, "registration_open": body.open}
+async def login(request: Request):
+    b = await request.json()
+    with conn() as c:
+        r = c.execute("SELECT * FROM users WHERE username=?",
+                      (b.get("username", ""),)).fetchone()
+        if not r or not r["active"] or not check_pw(b.get("password", ""),
+                                                    r["password_hash"]):
+            return JSONResponse({"detail": "用户名或密码错误"}, status_code=401)
+        token = secrets.token_hex(32)
+        exp = (datetime.now() + timedelta(hours=TOKEN_TTL_HOURS)).isoformat()
+        c.execute("UPDATE users SET session_token=?, session_expires_at=? WHERE id=?",
+                  (token, exp, r["id"]))
+        audit(c, r["username"], "登录", r["username"], "登录成功")
+        return {"token": token, "username": r["username"],
+                "display_name": r["display_name"],
+                "must_change_password": bool(r["must_change_password"])}
 
 
 @app.post("/api/change-password")
-def change_pw(body: ChangePwIn, wine_token: Optional[str] = Cookie(default=None)):
-    u = require_user(wine_token)
-    if len(body.new_password) < 6:
-        raise HTTPException(400, "新密码至少6位")
-    with db() as c:
-        row = c.execute("SELECT * FROM users WHERE id=?", (u["id"],)).fetchone()
-        if not secrets.compare_digest(hash_pw(body.old_password, row["salt"]), row["pw_hash"]):
-            raise HTTPException(400, "原密码不对")
-        salt = secrets.token_hex(8)
-        c.execute("UPDATE users SET pw_hash=?,salt=? WHERE id=?", (hash_pw(body.new_password, salt), salt, u["id"]))
+async def change_password(request: Request):
+    u = await current_user(request)
+    if not u:
+        return JSONResponse({"detail": "未登录"}, status_code=401)
+    b = await request.json()
+    if not check_pw(b.get("old_password", ""), u["password_hash"]):
+        return err("原密码错误")
+    new = b.get("new_password", "")
+    if len(new) < 6:
+        return err("新密码至少 6 位")
+    with conn() as c:
+        c.execute("UPDATE users SET password_hash=?, must_change_password=0 WHERE id=?",
+                  (hash_pw(new), u["id"]))
+        audit(c, u["username"], "改密码", u["username"], "修改密码")
     return {"ok": True}
 
 
-# ---------------------------------------------------------------- 档案
-def _list(table, token):
-    require_user(token)
-    with db() as c:
-        return [dict(r) for r in c.execute(f"SELECT * FROM {table} ORDER BY id")]
+@app.post("/api/logout")
+async def logout(request: Request):
+    u = await current_user(request)
+    if not u:
+        return JSONResponse({"detail": "未登录"}, status_code=401)
+    with conn() as c:
+        c.execute("UPDATE users SET session_token=NULL WHERE id=?", (u["id"],))
+    return {"ok": True}
 
 
-@app.get("/api/products")
-def products(wine_token: Optional[str] = Cookie(default=None)):
-    return _list("products", wine_token)
+@app.get("/api/users")
+async def list_users(request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        return rows(c, "SELECT id,username,display_name,active,"
+                       "must_change_password,created_at FROM users ORDER BY id")
 
 
-@app.post("/api/products")
-def add_product(body: ProductIn, wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    if body.type not in ("酒", "附件"):
-        raise HTTPException(400, "类型只能是酒或附件")
-    if not body.name.strip():
-        raise HTTPException(400, "名字不能为空")
-    with db() as c:
-        cur = c.execute(
-            "INSERT INTO products(type,name,category,vintage,origin,note,created_at) VALUES(?,?,?,?,?,?,?)",
-            (body.type, body.name.strip(), body.category.strip(), body.vintage.strip(),
-             body.origin.strip(), body.note.strip(), now_iso()),
-        )
-        return {"id": cur.lastrowid}
+@app.post("/api/users")
+async def create_user(request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    b = await request.json()
+    if not b.get("username") or not b.get("password"):
+        return err("用户名和密码必填")
+    with conn() as c:
+        if c.execute("SELECT 1 FROM users WHERE username=?",
+                     (b["username"],)).fetchone():
+            return err("用户名已存在")
+        cur = c.execute("INSERT INTO users(username,display_name,password_hash,"
+                        "must_change_password,created_at) VALUES(?,?,?,?,?)",
+                        (b["username"], b.get("display_name", b["username"]),
+                         hash_pw(b["password"]), 1 if b.get("must_change_password")
+                         else 0, datetime.now().isoformat()))
+        audit(c, u["username"], "新增管理员", b["username"], "")
+        return {"ok": True, "id": cur.lastrowid}
 
 
-@app.put("/api/products/{pid}")
-def edit_product(pid: int, body: ProductIn, wine_token: Optional[str] = Cookie(default=None)):
-    u = require_user(wine_token)
-    if body.type not in ("酒", "附件"):
-        raise HTTPException(400, "类型只能是酒或附件")
-    if not body.name.strip():
-        raise HTTPException(400, "名字不能为空")
-    with db() as c:
-        old = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
-        if not old:
-            raise HTTPException(404, "商品不存在")
-        c.execute(
-            "UPDATE products SET type=?,name=?,category=?,vintage=?,origin=?,note=? WHERE id=?",
-            (body.type, body.name.strip(), body.category.strip(), body.vintage.strip(),
-             body.origin.strip(), body.note.strip(), pid))
-        new = c.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
-        log_edit(c, "product", pid, dict(old), dict(new), u["username"])
-    return {"ok": True, "id": pid}
+@app.put("/api/users/{uid}")
+async def update_user(uid: int, request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    b = await request.json()
+    with conn() as c:
+        r = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        if not r:
+            return err("用户不存在", 404)
+        if "display_name" in b:
+            c.execute("UPDATE users SET display_name=? WHERE id=?",
+                      (b["display_name"], uid))
+        if b.get("password"):
+            c.execute("UPDATE users SET password_hash=?, must_change_password=? "
+                      "WHERE id=?", (hash_pw(b["password"]),
+                                     1 if b.get("must_change_password") else 0, uid))
+        if "active" in b:
+            c.execute("UPDATE users SET active=? WHERE id=?",
+                      (1 if b["active"] else 0, uid))
+        audit(c, u["username"], "修改管理员", r["username"],
+              f"display_name/active/password 更新")
+        return {"ok": True}
 
 
-@app.get("/api/suppliers")
-def suppliers(wine_token: Optional[str] = Cookie(default=None)):
-    return _list("suppliers", wine_token)
+@app.get("/api/audit-logs")
+async def list_audit(request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        return rows(c, "SELECT * FROM audit_logs ORDER BY id DESC LIMIT 200")
+
+# ---------- 酒库 / 仓库 / 往来单位 ----------
+@app.get("/api/wines")
+async def list_wines(request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        ws = rows(c, "SELECT * FROM wines ORDER BY id DESC")
+        for w in ws:
+            s = c.execute("SELECT COALESCE(SUM(quantity),0) s FROM stock WHERE wine_id=?",
+                          (w["id"],)).fetchone()
+            w["stock_total"] = s["s"]
+        return ws
 
 
-@app.post("/api/suppliers")
-def add_supplier(body: PartyIn, wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    if not body.name.strip():
-        raise HTTPException(400, "名字不能为空")
-    with db() as c:
-        cur = c.execute(
-            "INSERT INTO suppliers(name,phone,note,created_at) VALUES(?,?,?,?)",
-            (body.name.strip(), body.phone.strip(), body.note.strip(), now_iso()),
-        )
-        return {"id": cur.lastrowid}
+@app.post("/api/wines")
+async def create_wine(request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    b = await request.json()
+    if not b.get("name"):
+        return err("酒名必填")
+    now = datetime.now().isoformat()
+    with conn() as c:
+        try:
+            cur = c.execute(
+                "INSERT INTO wines(barcode,name,brand,spec,capacity_ml,abv,origin,"
+                "manufacturer,description,created_at,updated_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (b.get("barcode") or None, b["name"], b.get("brand"),
+                 b.get("spec"), b.get("capacity_ml"), b.get("abv"),
+                 b.get("origin"), b.get("manufacturer"),
+                 b.get("description"), now, now))
+        except sqlite3.IntegrityError:
+            return err("条码已存在")
+        audit(c, u["username"], "新增酒", b["name"], "")
+        return {"ok": True, "id": cur.lastrowid}
 
 
-@app.put("/api/suppliers/{sid}")
-def edit_supplier(sid: int, body: PartyIn, wine_token: Optional[str] = Cookie(default=None)):
-    u = require_user(wine_token)
-    if not body.name.strip():
-        raise HTTPException(400, "名字不能为空")
-    with db() as c:
-        old = c.execute("SELECT * FROM suppliers WHERE id=?", (sid,)).fetchone()
-        if not old:
-            raise HTTPException(404, "供应商不存在")
-        c.execute(
-            "UPDATE suppliers SET name=?,phone=?,note=? WHERE id=?",
-            (body.name.strip(), body.phone.strip(), body.note.strip(), sid))
-        new = c.execute("SELECT * FROM suppliers WHERE id=?", (sid,)).fetchone()
-        log_edit(c, "supplier", sid, dict(old), dict(new), u["username"])
-    return {"ok": True, "id": sid}
+@app.put("/api/wines/{wid}")
+async def update_wine(wid: int, request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    b = await request.json()
+    fields = ["barcode", "name", "brand", "spec", "capacity_ml", "abv", "origin",
+              "manufacturer", "description"]
+    with conn() as c:
+        sets = ", ".join(f"{f}=?" for f in fields if f in b)
+        if not sets:
+            return err("无可更新字段")
+        try:
+            c.execute(f"UPDATE wines SET {sets}, updated_at=? WHERE id=?",
+                      *([b[f] for f in fields if f in b] +
+                        [datetime.now().isoformat(), wid]))
+        except sqlite3.IntegrityError:
+            return err("条码已存在")
+        audit(c, u["username"], "修改酒", str(wid), "")
+        return {"ok": True}
 
 
-@app.get("/api/customers")
-def customers(wine_token: Optional[str] = Cookie(default=None)):
-    return _list("customers", wine_token)
+@app.post("/api/wines/{wid}/image")
+async def upload_wine_image(wid: int, request: Request):
+    """图片上传用原始 body (避免引入 python-multipart, 依赖只留 3 个).
+    前端 fetch 直接把文件当 body 发, 文件名放 X-Filename 头."""
+    u, e = await require_user(request)
+    if e:
+        return e
+    ext = Path(request.headers.get("X-Filename", "")).suffix.lower()
+    if ext not in (".jpg", ".jpeg", ".png", ".webp"):
+        return err("只允许 jpg/png/webp")
+    data = await request.body()
+    if len(data) > 5 * 1024 * 1024:
+        return err("单张图片 ≤5MB")
+    fn = f"wine_{wid}_{int(datetime.now().timestamp())}{ext}"
+    (UPLOAD_DIR / fn).write_bytes(data)
+    with conn() as c:
+        c.execute("UPDATE wines SET image_path=? WHERE id=?", (f"uploads/{fn}", wid))
+    return {"ok": True, "image_path": f"uploads/{fn}"}
 
 
-@app.post("/api/customers")
-def add_customer(body: CustomerIn, wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    if not body.name.strip():
-        raise HTTPException(400, "名字不能为空")
-    with db() as c:
-        cur = c.execute(
-            "INSERT INTO customers(name,phone,address,note,created_at) VALUES(?,?,?,?,?)",
-            (body.name.strip(), body.phone.strip(), body.address.strip(), body.note.strip(), now_iso()),
-        )
-        return {"id": cur.lastrowid}
-
-
-@app.put("/api/customers/{cid}")
-def edit_customer(cid: int, body: CustomerIn, wine_token: Optional[str] = Cookie(default=None)):
-    u = require_user(wine_token)
-    if not body.name.strip():
-        raise HTTPException(400, "名字不能为空")
-    with db() as c:
-        old = c.execute("SELECT * FROM customers WHERE id=?", (cid,)).fetchone()
-        if not old:
-            raise HTTPException(404, "客户不存在")
-        c.execute(
-            "UPDATE customers SET name=?,phone=?,address=?,note=? WHERE id=?",
-            (body.name.strip(), body.phone.strip(), body.address.strip(), body.note.strip(), cid))
-        new = c.execute("SELECT * FROM customers WHERE id=?", (cid,)).fetchone()
-        log_edit(c, "customer", cid, dict(old), dict(new), u["username"])
-    return {"ok": True, "id": cid}
+@app.get("/api/barcode")
+async def barcode_lookup(request: Request, code: str = ""):
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        r = c.execute("SELECT * FROM wines WHERE barcode=?", (code,)).fetchone()
+        if r:
+            return {"found": True, "source": "local", **rowdict(r)}
+    url = os.environ.get("BARCODE_API_URL", "")
+    key = os.environ.get("BARCODE_API_KEY", "")
+    if not url:
+        return {"found": False}
+    try:
+        sep = "&" if "?" in url else "?"
+        full = f"{url}{sep}code={code}"
+        req = urllib.request.Request(full, headers={"Authorization": f"Bearer {key}"}
+                                     if key else {})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        # 兼容常见字段名, 未知结构则视为未查到
+        if isinstance(data, dict):
+            item = data.get("data") or data
+            if isinstance(item, dict) and (item.get("name") or item.get("goodsName")):
+                return {"found": True, "source": "api",
+                        "name": item.get("name") or item.get("goodsName"),
+                        "brand": item.get("brand") or item.get("brandName"),
+                        "spec": item.get("spec") or item.get("specification"),
+                        "manufacturer": item.get("manufacturer"),
+                        "origin": item.get("origin"),
+                        "image_url": item.get("image") or item.get("imageUrl")}
+        return {"found": False}
+    except Exception:
+        return {"found": False}
 
 
 @app.get("/api/warehouses")
-def warehouses(wine_token: Optional[str] = Cookie(default=None)):
-    return _list("warehouses", wine_token)
+async def list_wh(request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        return rows(c, "SELECT * FROM warehouses ORDER BY id")
 
 
 @app.post("/api/warehouses")
-def add_warehouse(body: WarehouseIn, wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    if not body.name.strip():
-        raise HTTPException(400, "名字不能为空")
-    with db() as c:
-        cur = c.execute(
-            "INSERT INTO warehouses(name,note,created_at) VALUES(?,?,?)",
-            (body.name.strip(), body.note.strip(), now_iso()),
-        )
-        return {"id": cur.lastrowid}
+async def create_wh(request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    b = await request.json()
+    with conn() as c:
+        cur = c.execute("INSERT INTO warehouses(name) VALUES(?)", (b.get("name"),))
+        return {"ok": True, "id": cur.lastrowid}
 
 
-@app.put("/api/warehouses/{wid}")
-def edit_warehouse(wid: int, body: WarehouseIn, wine_token: Optional[str] = Cookie(default=None)):
-    u = require_user(wine_token)
-    if not body.name.strip():
-        raise HTTPException(400, "名字不能为空")
-    with db() as c:
-        old = c.execute("SELECT * FROM warehouses WHERE id=?", (wid,)).fetchone()
-        if not old:
-            raise HTTPException(404, "仓库不存在")
-        c.execute("UPDATE warehouses SET name=?,note=? WHERE id=?",
-                  (body.name.strip(), body.note.strip(), wid))
-        new = c.execute("SELECT * FROM warehouses WHERE id=?", (wid,)).fetchone()
-        log_edit(c, "warehouse", wid, dict(old), dict(new), u["username"])
-    return {"ok": True, "id": wid}
+def party_routes(kind, table):
+    async def lst(request: Request):
+        u, e = await require_user(request)
+        if e:
+            return e
+        with conn() as c:
+            ps = rows(c, f"SELECT * FROM {table} ORDER BY id DESC")
+            for p in ps:
+                if kind == "supplier":
+                    t = c.execute("SELECT COALESCE(SUM(goods_total),0) tot FROM "
+                                  "inbound_orders WHERE supplier_id=? AND type='purchase'",
+                                  (p["id"],)).fetchone()["tot"]
+                    paid = c.execute("SELECT COALESCE(SUM(p.amount),0) s FROM payments p "
+                                     "JOIN inbound_orders o ON o.id=p.order_id "
+                                     "WHERE p.order_type='inbound' AND o.supplier_id=? "
+                                     "AND o.type='purchase'", (p["id"],)).fetchone()["s"]
+                else:
+                    t = c.execute("SELECT COALESCE(SUM(sale_total),0) tot FROM "
+                                  "outbound_orders WHERE customer_id=? AND type='sale'",
+                                  (p["id"],)).fetchone()["tot"]
+                    paid = c.execute("SELECT COALESCE(SUM(p.amount),0) s FROM payments p "
+                                     "JOIN outbound_orders o ON o.id=p.order_id "
+                                     "WHERE p.order_type='outbound' AND o.customer_id=?",
+                                     (p["id"],)).fetchone()["s"]
+                p["balance"] = round(t - paid, 2)
+                if kind == "customer":
+                    g = c.execute("SELECT COALESCE(SUM(i.qty),0) q,"
+                                  " COALESCE(SUM(i.qty*i.cost_price),0) c"
+                                  " FROM outbound_items i JOIN outbound_orders o"
+                                  " ON o.id=i.order_id"
+                                  " WHERE o.type='gift' AND o.customer_id=?",
+                                  (p["id"],)).fetchone()
+                    p["gift_qty"] = int(g["q"])
+                    p["gift_cost"] = round(g["c"], 2)
+            return ps
+
+    async def create(request: Request):
+        u, e = await require_user(request)
+        if e:
+            return e
+        b = await request.json()
+        if not b.get("name"):
+            return err("名称必填")
+        with conn() as c:
+            cur = c.execute(f"INSERT INTO {table}(name,contact,phone,address,note)"
+                            " VALUES(?,?,?,?,?)",
+                            (b["name"], b.get("contact"), b.get("phone"),
+                             b.get("address"), b.get("note")))
+            audit(c, u["username"], f"新增{'供应商' if kind == 'supplier' else '客户'}",
+                  b["name"], "")
+            return {"ok": True, "id": cur.lastrowid}
+
+    async def update(pid: int, request: Request):
+        u, e = await require_user(request)
+        if e:
+            return e
+        b = await request.json()
+        fields = ["name", "contact", "phone", "address", "note", "active"]
+        sets = ", ".join(f"{f}=?" for f in fields if f in b)
+        if not sets:
+            return err("无可更新字段")
+        with conn() as c:
+            c.execute(f"UPDATE {table} SET {sets} WHERE id=?",
+                      *([b[f] for f in fields if f in b] + [pid]))
+            audit(c, u["username"], f"修改{'供应商' if kind == 'supplier' else '客户'}",
+                  str(pid), "")
+            return {"ok": True}
+    return lst, create, update
 
 
-# ---------------------------------------------------------------- 采购入库
-@app.post("/api/purchase-orders")
-def create_purchase(body: PurchaseIn, wine_token: Optional[str] = Cookie(default=None)):
-    u = require_user(wine_token)
-    if body.type not in ("采购入库", "期初库存"):
-        raise HTTPException(400, "单据类型不对")
-    if body.type == "采购入库" and not body.supplier_id:
-        raise HTTPException(400, "采购入库必须选供应商")
-    if body.pay_status not in ("已付款", "未付款"):
-        raise HTTPException(400, "付款状态不对")
-    if not body.lines:
-        raise HTTPException(400, "至少一行明细")
-    freight = to_cents(body.freight or "0")
-    lines = []
-    for ln in body.lines:
-        if ln.qty <= 0:
-            raise HTTPException(400, "数量必须大于0")
-        up = to_cents(ln.unit_price)
-        lines.append((ln.product_id, ln.qty, up, up * ln.qty))
-    goods = sum(x[3] for x in lines)
-    weights = [x[3] for x in lines] if goods > 0 else [x[1] for x in lines]
-    shares = alloc_freight(freight, weights)
-    with db() as c:
-        if body.idempotency_key:
-            old = c.execute(
-                "SELECT id,order_no FROM purchase_orders WHERE idempotency_key=?",
-                (body.idempotency_key,),
-            ).fetchone()
-            if old:
-                return {"id": old["id"], "order_no": old["order_no"], "duplicated": True}
-        if not c.execute("SELECT id FROM warehouses WHERE id=?", (body.warehouse_id,)).fetchone():
-            raise HTTPException(400, "仓库不存在")
-        if body.supplier_id and not c.execute(
-            "SELECT id FROM suppliers WHERE id=?", (body.supplier_id,)
-        ).fetchone():
-            raise HTTPException(400, "供应商不存在")
-        for pid, *_ in lines:
-            if not c.execute("SELECT id FROM products WHERE id=?", (pid,)).fetchone():
-                raise HTTPException(400, "商品不存在")
-        order_no = next_no(c, "RK", "purchase_orders", "order_no")
-        cur = c.execute(
-            "INSERT INTO purchase_orders(order_no,type,supplier_id,warehouse_id,biz_date,"
-            "freight_cents,goods_cents,total_cents,status,idempotency_key,note,created_by,created_at,pay_status)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (order_no, body.type, body.supplier_id, body.warehouse_id, body.biz_date,
-             freight, goods, goods + freight, "已确认", body.idempotency_key or None,
-             body.note.strip(), u["username"], now_iso(),
-             body.pay_status if body.type == "采购入库" else "未付款"),
-        )
-        oid = cur.lastrowid
-        for (pid, qty, up, lt), share in zip(lines, shares):
-            bcur = c.execute(
-                "INSERT INTO batches(product_id,supplier_id,purchase_line_id,qty_initial,"
-                "unit_price_cents,total_cost_cents,biz_date,created_at) VALUES(?,?,NULL,?,?,?,?,?)",
-                (pid, body.supplier_id, qty, up, lt + share, body.biz_date, now_iso()),
-            )
-            bid = bcur.lastrowid
-            lcur = c.execute(
-                "INSERT INTO purchase_lines(order_id,product_id,qty,unit_price_cents,"
-                "line_total_cents,freight_share_cents,batch_id) VALUES(?,?,?,?,?,?,?)",
-                (oid, pid, qty, up, lt, share, bid),
-            )
-            c.execute("UPDATE batches SET purchase_line_id=? WHERE id=?", (lcur.lastrowid, bid))
-            c.execute(
-                "INSERT INTO inventory_balances(batch_id,warehouse_id,qty) VALUES(?,?,?)",
-                (bid, body.warehouse_id, qty),
-            )
-            c.execute(
-                "INSERT INTO inventory_txns(txn_type,product_id,batch_id,warehouse_id,qty_delta,"
-                "ref_type,ref_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                ("期初" if body.type == "期初库存" else "入库", pid, bid, body.warehouse_id,
-                 qty, "purchase_order", oid, order_no, now_iso()),
-            )
-        if body.type == "采购入库":
-            pcur = c.execute(
-                "INSERT INTO payables(supplier_id,purchase_order_id,amount_cents,biz_date,created_at)"
-                " VALUES(?,?,?,?,?)",
-                (body.supplier_id, oid, goods + freight, body.biz_date, now_iso()),
-            )
-            if body.pay_status == "已付款" and goods + freight > 0:
-                # 已付款: 应付生成后立即记一笔全额付款核销, 余额为 0
-                c.execute(
-                    "INSERT INTO payments(payable_id,supplier_id,amount_cents,pay_date,note,created_at)"
-                    " VALUES(?,?,?,?,?,?)",
-                    (pcur.lastrowid, body.supplier_id, goods + freight, body.biz_date,
-                     "入库时已付款", now_iso()))
-                c.execute("UPDATE payables SET paid_cents=? WHERE id=?",
-                          (goods + freight, pcur.lastrowid))
-    return {"id": oid, "order_no": order_no, "duplicated": False}
+_sup_lst, _sup_create, _sup_update = party_routes("supplier", "suppliers")
+_cus_lst, _cus_create, _cus_update = party_routes("customer", "customers")
+app.get("/api/suppliers")(_sup_lst)
+app.post("/api/suppliers")(_sup_create)
+app.put("/api/suppliers/{pid}")(_sup_update)
+app.get("/api/customers")(_cus_lst)
+app.post("/api/customers")(_cus_create)
+app.put("/api/customers/{pid}")(_cus_update)
 
 
-@app.get("/api/purchase-orders")
-def list_purchases(wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    with db() as c:
-        rows = c.execute(
-            "SELECT o.*, s.name supplier_name, w.name warehouse_name FROM purchase_orders o "
-            "LEFT JOIN suppliers s ON s.id=o.supplier_id "
-            "LEFT JOIN warehouses w ON w.id=o.warehouse_id ORDER BY o.id DESC LIMIT 100"
-        ).fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            d["lines"] = [dict(x) for x in c.execute(
-                "SELECT l.*, p.name product_name FROM purchase_lines l "
-                "JOIN products p ON p.id=l.product_id WHERE l.order_id=?", (d["id"],))]
-            out.append(d)
-        return out
+# ---------- 库存 / 单据 ----------
+def next_order_no(c, table, prefix, col="order_no"):
+    today = date.today().strftime("%Y%m%d")
+    n = c.execute(f"SELECT COUNT(*) FROM {table} WHERE {col} LIKE ?",
+                  (f"{prefix}{today}-%",)).fetchone()[0] + 1
+    return f"{prefix}{today}-{n:03d}"
 
 
-@app.post("/api/purchase-orders/{oid}/cancel")
-def cancel_purchase(oid: int, wine_token: Optional[str] = Cookie(default=None)):
-    """作废重录: 仅当未付款且批次库存未动(未调拨)时可作废, 冲销流水留痕。"""
-    require_user(wine_token)
-    with db() as c:
-        o = c.execute("SELECT * FROM purchase_orders WHERE id=?", (oid,)).fetchone()
-        if not o:
-            raise HTTPException(404, "单据不存在")
-        if o["status"] == "已作废":
-            raise HTTPException(400, "已作废")
-        pay = c.execute("SELECT * FROM payables WHERE purchase_order_id=?", (oid,)).fetchone()
-        if pay and pay["paid_cents"] > 0:
-            raise HTTPException(400, "已付款,不能作废")
-        lines = c.execute("SELECT * FROM purchase_lines WHERE order_id=?", (oid,)).fetchall()
-        for ln in lines:
-            bal = c.execute(
-                "SELECT COALESCE(SUM(qty),0) q FROM inventory_balances WHERE batch_id=?",
-                (ln["batch_id"],)).fetchone()["q"]
-            if bal != ln["qty"]:
-                raise HTTPException(400, "库存已变动,不能作废")
-        for ln in lines:
-            c.execute("DELETE FROM inventory_balances WHERE batch_id=?", (ln["batch_id"],))
-            c.execute(
-                "INSERT INTO inventory_txns(txn_type,product_id,batch_id,warehouse_id,qty_delta,"
-                "ref_type,ref_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                ("作废冲销", ln["product_id"], ln["batch_id"], o["warehouse_id"], -ln["qty"],
-                 "purchase_order", oid, o["order_no"], now_iso()),
-            )
-        if pay:
-            c.execute("DELETE FROM payables WHERE id=?", (pay["id"],))
-        c.execute("UPDATE purchase_orders SET status='已作废' WHERE id=?", (oid,))
-    return {"ok": True}
+def add_stock(c, wh, wine, batch, qty):
+    c.execute("INSERT INTO stock(warehouse_id,wine_id,batch,quantity) VALUES(?,?,?,?)"
+              " ON CONFLICT(warehouse_id,wine_id,batch) DO UPDATE SET"
+              " quantity=quantity+excluded.quantity",
+              (wh, wine, batch or "", qty))
 
 
-@app.put("/api/purchase-orders/{oid}")
-def edit_purchase(oid: int, body: PurchaseEditIn, wine_token: Optional[str] = Cookie(default=None)):
-    """改入库单: 仅当本单批次未被出库消耗/未调拨时可改; 批次成本与应付重算。
-
-    把关: 已有付款时新应付总额不得小于已付; 改后库存不得小于已预定数量。
-    """
-    u = require_user(wine_token)
-    if body.pay_status not in ("已付款", "未付款"):
-        raise HTTPException(400, "付款状态不对")
-    if not body.lines:
-        raise HTTPException(400, "至少一行明细")
-    freight = to_cents(body.freight or "0")
-    lines = []
-    for ln in body.lines:
-        if ln.qty <= 0:
-            raise HTTPException(400, "数量必须大于0")
-        up = to_cents(ln.unit_price)
-        lines.append((ln.product_id, ln.qty, up, up * ln.qty))
-    goods = sum(x[3] for x in lines)
-    weights = [x[3] for x in lines] if goods > 0 else [x[1] for x in lines]
-    shares = alloc_freight(freight, weights)
-    new_total = goods + freight
-    with db() as c:
-        o = c.execute("SELECT * FROM purchase_orders WHERE id=?", (oid,)).fetchone()
-        if not o:
-            raise HTTPException(404, "单据不存在")
-        if o["status"] == "已作废":
-            raise HTTPException(400, "已作废的单不可改")
-        if o["type"] == "采购入库" and not body.supplier_id:
-            raise HTTPException(400, "采购入库必须选供应商")
-        if not c.execute("SELECT id FROM warehouses WHERE id=?", (body.warehouse_id,)).fetchone():
-            raise HTTPException(400, "仓库不存在")
-        if body.supplier_id and not c.execute(
-            "SELECT id FROM suppliers WHERE id=?", (body.supplier_id,)).fetchone():
-            raise HTTPException(400, "供应商不存在")
-        for pid, *_ in lines:
-            if not c.execute("SELECT id FROM products WHERE id=?", (pid,)).fetchone():
-                raise HTTPException(400, "商品不存在")
-        old_lines = c.execute("SELECT * FROM purchase_lines WHERE order_id=?", (oid,)).fetchall()
-        # 把关1: 本单批次必须完整未动(未出库消耗、未调拨、余额全在原仓且等于初始量)
-        for ln in old_lines:
-            bid = ln["batch_id"]
-            consumed = c.execute(
-                "SELECT COUNT(*) FROM sales_allocations WHERE batch_id=?", (bid,)).fetchone()[0]
-            moved = c.execute(
-                "SELECT COUNT(*) FROM transfer_lines WHERE batch_id=?", (bid,)).fetchone()[0]
-            bal = c.execute(
-                "SELECT warehouse_id, qty FROM inventory_balances WHERE batch_id=?", (bid,)).fetchall()
-            if consumed or moved or len(bal) != 1 or bal[0]["warehouse_id"] != o["warehouse_id"] \
-                    or bal[0]["qty"] != ln["qty"]:
-                raise HTTPException(400, "批次已被消耗或已调拨,不可改,请取消冲销后重录")
-        # 把关2: 应付与付款状态
-        pay = c.execute("SELECT * FROM payables WHERE purchase_order_id=?", (oid,)).fetchone()
-        paid = pay["paid_cents"] if pay else 0
-        if pay and new_total < paid:
-            raise HTTPException(400, "新应付总额小于已付金额,请先处理付款记录")
-        if pay and body.pay_status == "未付款" and paid > 0:
-            raise HTTPException(400, "已有付款记录,不能改回未付款")
-        # 把关3: 改后各商品在新仓的库存不得小于已预定数量
-        delta = {}
-        for ln in old_lines:
-            k = (ln["product_id"], o["warehouse_id"])
-            delta[k] = delta.get(k, 0) - ln["qty"]
-        for pid, qty, *_ in lines:
-            k = (pid, body.warehouse_id)
-            delta[k] = delta.get(k, 0) + qty
-        for (pid, wid), d in delta.items():
-            if stock_qty(c, pid, wid) + d < reserved_qty(c, pid, wid):
-                raise HTTPException(400, "改后库存小于已预定数量,不可改")
-        before = {"order": dict(o), "lines": [dict(x) for x in old_lines],
-                  "payable": dict(pay) if pay else None}
-        # 冲销旧批次库存并重建(流水留痕)
-        for ln in old_lines:
-            c.execute("DELETE FROM inventory_balances WHERE batch_id=?", (ln["batch_id"],))
-            c.execute(
-                "INSERT INTO inventory_txns(txn_type,product_id,batch_id,warehouse_id,qty_delta,"
-                "ref_type,ref_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                ("入库修改冲销", ln["product_id"], ln["batch_id"], o["warehouse_id"], -ln["qty"],
-                 "purchase_order", oid, o["order_no"], now_iso()))
-            c.execute("DELETE FROM batches WHERE id=?", (ln["batch_id"],))
-        c.execute("DELETE FROM purchase_lines WHERE order_id=?", (oid,))
-        for (pid, qty, up, lt), share in zip(lines, shares):
-            bcur = c.execute(
-                "INSERT INTO batches(product_id,supplier_id,purchase_line_id,qty_initial,"
-                "unit_price_cents,total_cost_cents,biz_date,created_at) VALUES(?,?,NULL,?,?,?,?,?)",
-                (pid, body.supplier_id, qty, up, lt + share, body.biz_date, now_iso()))
-            bid = bcur.lastrowid
-            lcur = c.execute(
-                "INSERT INTO purchase_lines(order_id,product_id,qty,unit_price_cents,"
-                "line_total_cents,freight_share_cents,batch_id) VALUES(?,?,?,?,?,?,?)",
-                (oid, pid, qty, up, lt, share, bid))
-            c.execute("UPDATE batches SET purchase_line_id=? WHERE id=?", (lcur.lastrowid, bid))
-            c.execute(
-                "INSERT INTO inventory_balances(batch_id,warehouse_id,qty) VALUES(?,?,?)",
-                (bid, body.warehouse_id, qty))
-            c.execute(
-                "INSERT INTO inventory_txns(txn_type,product_id,batch_id,warehouse_id,qty_delta,"
-                "ref_type,ref_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                ("入库修改", pid, bid, body.warehouse_id, qty,
-                 "purchase_order", oid, o["order_no"], now_iso()))
-        # 应付重算; 改为已付款时把差额记一笔付款核销
-        new_pay_status = o["pay_status"] or "未付款"
-        if pay:
-            c.execute("UPDATE payables SET supplier_id=?,amount_cents=?,biz_date=? WHERE id=?",
-                      (body.supplier_id, new_total, body.biz_date, pay["id"]))
-            if body.pay_status == "已付款" and new_total > paid:
-                c.execute(
-                    "INSERT INTO payments(payable_id,supplier_id,amount_cents,pay_date,note,created_at)"
-                    " VALUES(?,?,?,?,?,?)",
-                    (pay["id"], body.supplier_id, new_total - paid, body.biz_date,
-                     "入库修改时已付款", now_iso()))
-                c.execute("UPDATE payables SET paid_cents=? WHERE id=?", (new_total, pay["id"]))
-                new_pay_status = "已付款"
-            elif body.pay_status == "未付款":
-                new_pay_status = "未付款"
-        c.execute(
-            "UPDATE purchase_orders SET supplier_id=?,warehouse_id=?,biz_date=?,freight_cents=?,"
-            "goods_cents=?,total_cents=?,note=?,pay_status=? WHERE id=?",
-            (body.supplier_id, body.warehouse_id, body.biz_date, freight, goods, new_total,
-             body.note.strip(), new_pay_status, oid))
-        after_o = c.execute("SELECT * FROM purchase_orders WHERE id=?", (oid,)).fetchone()
-        after = {"order": dict(after_o),
-                 "lines": [dict(x) for x in c.execute(
-                     "SELECT * FROM purchase_lines WHERE order_id=?", (oid,))],
-                 "payable": dict(c.execute(
-                     "SELECT * FROM payables WHERE purchase_order_id=?", (oid,)).fetchone())
-                 if pay else None}
-        log_edit(c, "purchase_order", oid, before, after, u["username"])
-    return {"ok": True, "id": oid}
+def get_stock(c, wh, wine, batch=""):
+    r = c.execute("SELECT quantity FROM stock WHERE warehouse_id=? AND wine_id=?"
+                  " AND batch=?", (wh, wine, batch or "")).fetchone()
+    return r["quantity"] if r else 0
 
 
-# ---------------------------------------------------------------- 库存
-@app.get("/api/inventory")
-def inventory(view: str = "product", wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    with db() as c:
-        if view == "warehouse":
-            rows = c.execute(
-                "SELECT bal.warehouse_id, b.product_id, w.name warehouse_name, p.name product_name, p.type, p.vintage, "
-                "SUM(bal.qty) qty FROM inventory_balances bal "
-                "JOIN batches b ON b.id=bal.batch_id JOIN products p ON p.id=b.product_id "
-                "JOIN warehouses w ON w.id=bal.warehouse_id WHERE bal.qty<>0 "
-                "GROUP BY bal.warehouse_id, b.product_id ORDER BY w.name, p.name"
-            ).fetchall()
-            out = []
-            for r in rows:
-                d = dict(r)
-                d["reserved_qty"] = reserved_qty(c, d["product_id"], d["warehouse_id"])
-                d["available_qty"] = d["qty"] - d["reserved_qty"]
-                out.append(d)
-            return out
-        if view == "batch":
-            rows = c.execute(
-                "SELECT b.id batch_id, p.name product_name, p.type, p.vintage, p.origin, "
-                "s.name supplier_name, b.biz_date, b.qty_initial, b.unit_price_cents, "
-                "b.total_cost_cents, COALESCE(SUM(bal.qty),0) qty_remaining, "
-                "GROUP_CONCAT(w.name||':'||bal.qty) locations "
-                "FROM batches b JOIN products p ON p.id=b.product_id "
-                "LEFT JOIN suppliers s ON s.id=b.supplier_id "
-                "LEFT JOIN inventory_balances bal ON bal.batch_id=b.id "
-                "LEFT JOIN warehouses w ON w.id=bal.warehouse_id "
-                "GROUP BY b.id ORDER BY b.id DESC"
-            ).fetchall()
-            out = []
-            for r in rows:
-                d = dict(r)
-                d["unit_cost"] = round(d["total_cost_cents"] / d["qty_initial"] / 100, 4) if d["qty_initial"] else 0
-                out.append(d)
-            return out
-        rows = c.execute(
-            "SELECT p.id product_id, p.name product_name, p.type, p.category, p.vintage, p.origin, "
-            "COALESCE(SUM(bal.qty),0) qty, "
-            "COALESCE(SUM(bal.qty * b.total_cost_cents / b.qty_initial),0) value_cents "
-            "FROM products p LEFT JOIN batches b ON b.product_id=p.id "
-            "LEFT JOIN inventory_balances bal ON bal.batch_id=b.id "
-            "GROUP BY p.id ORDER BY p.type, p.name"
-        ).fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            d["reserved_qty"] = reserved_qty(c, d["product_id"])
-            d["available_qty"] = d["qty"] - d["reserved_qty"]
-            out.append(d)
-        return out
+def paid_total(c, otype, oid):
+    r = c.execute("SELECT COALESCE(SUM(amount),0) s FROM payments WHERE order_type=?"
+                  " AND order_id=?", (otype, oid)).fetchone()
+    return r["s"]
 
 
-@app.get("/api/inventory-txns")
-def inventory_txns(wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    with db() as c:
-        rows = c.execute(
-            "SELECT t.*, p.name product_name, w.name warehouse_name FROM inventory_txns t "
-            "JOIN products p ON p.id=t.product_id "
-            "LEFT JOIN warehouses w ON w.id=t.warehouse_id ORDER BY t.id DESC LIMIT 200"
-        ).fetchall()
-        return [dict(r) for r in rows]
+def pay_status(paid, total):
+    if paid <= 0:
+        return "unpaid"
+    if paid + 1e-9 >= total:
+        return "paid"
+    return "partial"
 
 
-# ---------------------------------------------------------------- 调拨
-@app.post("/api/transfers")
-def create_transfer(body: TransferIn, wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    if body.from_warehouse_id == body.to_warehouse_id:
-        raise HTTPException(400, "调出调入不能是同一仓库")
-    if not body.lines:
-        raise HTTPException(400, "至少一行明细")
-    with db() as c:
-        if body.idempotency_key:
-            old = c.execute(
-                "SELECT id,transfer_no FROM transfers WHERE idempotency_key=?",
-                (body.idempotency_key,)).fetchone()
-            if old:
-                return {"id": old["id"], "transfer_no": old["transfer_no"], "duplicated": True}
-        # 先校验全部行库存足够(事务内原子扣减); 已被货单预定的可用库存不能调走
-        want_by_product = {}
-        for ln in body.lines:
-            if ln.qty <= 0:
-                raise HTTPException(400, "数量必须大于0")
-            bal = c.execute(
-                "SELECT qty FROM inventory_balances WHERE batch_id=? AND warehouse_id=?",
-                (ln.batch_id, body.from_warehouse_id)).fetchone()
-            if not bal or bal["qty"] < ln.qty:
-                raise HTTPException(400, "调出仓库存不足")
-            brow = c.execute("SELECT product_id FROM batches WHERE id=?", (ln.batch_id,)).fetchone()
-            if not brow:
-                raise HTTPException(400, "批次不存在")
-            want_by_product[brow["product_id"]] = want_by_product.get(brow["product_id"], 0) + ln.qty
-        for pid, want in want_by_product.items():
-            avail = stock_qty(c, pid, body.from_warehouse_id) - reserved_qty(c, pid, body.from_warehouse_id)
-            if want > avail:
-                raise HTTPException(400, "可用库存不足(部分已被货单预定)")
-        no = next_no(c, "DB", "transfers", "transfer_no")
-        cur = c.execute(
-            "INSERT INTO transfers(transfer_no,from_warehouse_id,to_warehouse_id,biz_date,"
-            "status,idempotency_key,note,created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (no, body.from_warehouse_id, body.to_warehouse_id, body.biz_date, "已确认",
-             body.idempotency_key or None, body.note.strip(), now_iso()),
-        )
-        tid = cur.lastrowid
-        for ln in body.lines:
-            batch = c.execute("SELECT product_id FROM batches WHERE id=?", (ln.batch_id,)).fetchone()
-            pid = batch["product_id"]
-            c.execute(
-                "UPDATE inventory_balances SET qty=qty-? WHERE batch_id=? AND warehouse_id=? AND qty>=?",
-                (ln.qty, ln.batch_id, body.from_warehouse_id, ln.qty))
-            c.execute(
-                "INSERT INTO inventory_balances(batch_id,warehouse_id,qty) VALUES(?,?,?) "
-                "ON CONFLICT(batch_id,warehouse_id) DO UPDATE SET qty=qty+excluded.qty",
-                (ln.batch_id, body.to_warehouse_id, ln.qty))
-            c.execute(
-                "INSERT INTO transfer_lines(transfer_id,batch_id,product_id,qty) VALUES(?,?,?,?)",
-                (tid, ln.batch_id, pid, ln.qty))
-            for ttype, wid, delta in (("调拨出", body.from_warehouse_id, -ln.qty),
-                                      ("调拨入", body.to_warehouse_id, ln.qty)):
-                c.execute(
-                    "INSERT INTO inventory_txns(txn_type,product_id,batch_id,warehouse_id,qty_delta,"
-                    "ref_type,ref_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (ttype, pid, ln.batch_id, wid, delta, "transfer", tid, no, now_iso()))
-    return {"id": tid, "transfer_no": no, "duplicated": False}
+def latest_cost(c, wine_id):
+    r = c.execute("SELECT unit_price FROM inbound_items WHERE wine_id=? ORDER BY id DESC"
+                  " LIMIT 1", (wine_id,)).fetchone()
+    return r["unit_price"] if r else 0.0
 
 
-@app.get("/api/transfers")
-def list_transfers(wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    with db() as c:
-        rows = c.execute(
-            "SELECT t.*, fw.name from_name, tw.name to_name FROM transfers t "
-            "JOIN warehouses fw ON fw.id=t.from_warehouse_id "
-            "JOIN warehouses tw ON tw.id=t.to_warehouse_id ORDER BY t.id DESC LIMIT 100"
-        ).fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            d["lines"] = [dict(x) for x in c.execute(
-                "SELECT l.*, p.name product_name FROM transfer_lines l "
-                "JOIN products p ON p.id=l.product_id WHERE l.transfer_id=?", (d["id"],))]
-            out.append(d)
-        return out
-
-
-@app.put("/api/transfers/{tid}")
-def edit_transfer(tid: int, body: TransferEditIn, wine_token: Optional[str] = Cookie(default=None)):
-    """改调拨单(数量/目标仓/日期/备注; 调出仓不变): 冲销原调拨流水后重记。
-
-    把关: 目标仓当前库存不足以冲销原调拨时拒绝; 重记时调出仓可用量校验同新建。
-    """
-    u = require_user(wine_token)
-    if not body.lines:
-        raise HTTPException(400, "至少一行明细")
-    with db() as c:
-        t = c.execute("SELECT * FROM transfers WHERE id=?", (tid,)).fetchone()
-        if not t:
-            raise HTTPException(404, "调拨单不存在")
-        from_wh = t["from_warehouse_id"]
-        if body.to_warehouse_id == from_wh:
-            raise HTTPException(400, "调出调入不能是同一仓库")
-        if not c.execute("SELECT id FROM warehouses WHERE id=?", (body.to_warehouse_id,)).fetchone():
-            raise HTTPException(400, "调入仓不存在")
-        old_lines = c.execute("SELECT * FROM transfer_lines WHERE transfer_id=?", (tid,)).fetchall()
-        # 把关1: 冲销可行性——原调入仓里该批次现存量必须够冲回
-        need_back = {}
-        for ln in old_lines:
-            need_back[ln["batch_id"]] = need_back.get(ln["batch_id"], 0) + ln["qty"]
-        for bid, q in need_back.items():
-            bal = c.execute(
-                "SELECT qty FROM inventory_balances WHERE batch_id=? AND warehouse_id=?",
-                (bid, t["to_warehouse_id"])).fetchone()
-            if not bal or bal["qty"] < q:
-                raise HTTPException(400, "目标仓库存不足以冲销原调拨,不可改")
-        # 把关2: 新明细校验(按冲销后的调出仓余额算)
-        new_lines = []
-        want_batch = {}
-        want_product = {}
-        for ln in body.lines:
-            if ln.qty <= 0:
-                raise HTTPException(400, "数量必须大于0")
-            brow = c.execute("SELECT product_id FROM batches WHERE id=?", (ln.batch_id,)).fetchone()
-            if not brow:
-                raise HTTPException(400, "批次不存在")
-            new_lines.append((ln.batch_id, brow["product_id"], ln.qty))
-            want_batch[ln.batch_id] = want_batch.get(ln.batch_id, 0) + ln.qty
-            want_product[brow["product_id"]] = want_product.get(brow["product_id"], 0) + ln.qty
-        for bid, q in want_batch.items():
-            bal = c.execute(
-                "SELECT qty FROM inventory_balances WHERE batch_id=? AND warehouse_id=?",
-                (bid, from_wh)).fetchone()
-            have = (bal["qty"] if bal else 0) + need_back.get(bid, 0)
-            if q > have:
-                raise HTTPException(400, "调出仓库存不足")
-        for pid, q in want_product.items():
-            back = sum(ln["qty"] for ln in old_lines if ln["product_id"] == pid)
-            avail = stock_qty(c, pid, from_wh) + back - reserved_qty(c, pid, from_wh)
-            if q > avail:
-                raise HTTPException(400, "可用库存不足(部分已被货单预定)")
-        before = {"transfer": dict(t), "lines": [dict(x) for x in old_lines]}
-        # 冲销原调拨
-        for ln in old_lines:
-            c.execute(
-                "UPDATE inventory_balances SET qty=qty-? WHERE batch_id=? AND warehouse_id=? AND qty>=?",
-                (ln["qty"], ln["batch_id"], t["to_warehouse_id"], ln["qty"]))
-            c.execute(
-                "INSERT INTO inventory_balances(batch_id,warehouse_id,qty) VALUES(?,?,?) "
-                "ON CONFLICT(batch_id,warehouse_id) DO UPDATE SET qty=qty+excluded.qty",
-                (ln["batch_id"], from_wh, ln["qty"]))
-            for ttype, wid, delta in (("调拨修改冲销出", t["to_warehouse_id"], -ln["qty"]),
-                                      ("调拨修改冲销入", from_wh, ln["qty"])):
-                c.execute(
-                    "INSERT INTO inventory_txns(txn_type,product_id,batch_id,warehouse_id,qty_delta,"
-                    "ref_type,ref_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (ttype, ln["product_id"], ln["batch_id"], wid, delta,
-                     "transfer", tid, t["transfer_no"], now_iso()))
-        c.execute("DELETE FROM transfer_lines WHERE transfer_id=?", (tid,))
-        # 重记新调拨
-        for bid, pid, qty in new_lines:
-            c.execute(
-                "UPDATE inventory_balances SET qty=qty-? WHERE batch_id=? AND warehouse_id=? AND qty>=?",
-                (qty, bid, from_wh, qty))
-            c.execute(
-                "INSERT INTO inventory_balances(batch_id,warehouse_id,qty) VALUES(?,?,?) "
-                "ON CONFLICT(batch_id,warehouse_id) DO UPDATE SET qty=qty+excluded.qty",
-                (bid, body.to_warehouse_id, qty))
-            c.execute(
-                "INSERT INTO transfer_lines(transfer_id,batch_id,product_id,qty) VALUES(?,?,?,?)",
-                (tid, bid, pid, qty))
-            for ttype, wid, delta in (("调拨修改出", from_wh, -qty),
-                                      ("调拨修改入", body.to_warehouse_id, qty)):
-                c.execute(
-                    "INSERT INTO inventory_txns(txn_type,product_id,batch_id,warehouse_id,qty_delta,"
-                    "ref_type,ref_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                    (ttype, pid, bid, wid, delta, "transfer", tid, t["transfer_no"], now_iso()))
-        c.execute("UPDATE transfers SET to_warehouse_id=?,biz_date=?,note=? WHERE id=?",
-                  (body.to_warehouse_id, body.biz_date, body.note.strip(), tid))
-        after = {"transfer": dict(c.execute("SELECT * FROM transfers WHERE id=?", (tid,)).fetchone()),
-                 "lines": [dict(x) for x in c.execute(
-                     "SELECT * FROM transfer_lines WHERE transfer_id=?", (tid,))]}
-        log_edit(c, "transfer", tid, before, after, u["username"])
-    return {"ok": True, "id": tid}
-
-
-# ---------------------------------------------------------------- 客户货单
-def _sales_order_dict(c, o):
-    d = dict(o)
-    d["lines"] = [dict(x) for x in c.execute(
-        "SELECT l.*, p.name product_name, p.type product_type, p.vintage, p.origin "
-        "FROM sales_lines l JOIN products p ON p.id=l.product_id WHERE l.order_id=? ORDER BY l.id",
-        (d["id"],))]
-    d["allocations"] = [dict(x) for x in c.execute(
-        "SELECT * FROM sales_allocations WHERE order_id=? ORDER BY id", (d["id"],))]
-    d["events"] = [dict(x) for x in c.execute(
-        "SELECT * FROM sales_order_events WHERE order_id=? ORDER BY id", (d["id"],))]
-    d["cost_cents"] = sum(a["cost_cents"] for a in d["allocations"])
-    d["public_path"] = f"/o/{d['public_token']}" if d.get("public_token") else ""
-    return d
-
-
-def _sales_event(c, oid, event, detail=""):
-    c.execute("INSERT INTO sales_order_events(order_id,event,detail,created_at) VALUES(?,?,?,?)",
-              (oid, event, detail, now_iso()))
-
-
-@app.post("/api/sales-orders")
-def create_sales(body: SalesIn, wine_token: Optional[str] = Cookie(default=None)):
-    u = require_user(wine_token)
-    if not body.lines:
-        raise HTTPException(400, "至少一行明细")
-    if body.freight_payer not in ("客户付", "自提无", "我方代付"):
-        raise HTTPException(400, "运费承担方不对")
-    if body.pay_status not in ("已付款", "未付款"):
-        raise HTTPException(400, "付款状态不对")
-    freight = to_cents(body.freight or "0")
-    if body.freight_payer == "自提无":
-        freight = 0
-    lines = []
-    for ln in body.lines:
-        if ln.qty <= 0:
-            raise HTTPException(400, "数量必须大于0")
-        if ln.line_type not in ("销售", "赠送"):
-            raise HTTPException(400, "行类型不对")
-        up = 0 if ln.line_type == "赠送" else to_cents(ln.unit_price or "0")
-        lines.append((ln.product_id, ln.qty, up, ln.line_type, up * ln.qty))
-    goods = sum(x[4] for x in lines)
-    total = goods + (freight if body.freight_payer == "客户付" else 0)
-    with db() as c:
-        if body.idempotency_key:
-            old = c.execute("SELECT id,order_no FROM sales_orders WHERE idempotency_key=?",
-                            (body.idempotency_key,)).fetchone()
-            if old:
-                return {"id": old["id"], "order_no": old["order_no"], "duplicated": True}
-        if not c.execute("SELECT id FROM customers WHERE id=?", (body.customer_id,)).fetchone():
-            raise HTTPException(400, "客户不存在")
-        if not c.execute("SELECT id FROM warehouses WHERE id=?", (body.warehouse_id,)).fetchone():
-            raise HTTPException(400, "仓库不存在")
-        want = {}
-        for pid, qty, *_ in lines:
-            if not c.execute("SELECT id FROM products WHERE id=?", (pid,)).fetchone():
-                raise HTTPException(400, "商品不存在")
-            want[pid] = want.get(pid, 0) + qty
-        for pid, q in want.items():
-            avail = stock_qty(c, pid, body.warehouse_id) - reserved_qty(c, pid, body.warehouse_id)
-            if q > avail:
-                raise HTTPException(400, "可用库存不足,无法预定")
-        order_no = next_no(c, "HD", "sales_orders", "order_no")
-        token = secrets.token_urlsafe(24)
-        pay_time = now_iso() if body.pay_status == "已付款" else None
-        cur = c.execute(
-            "INSERT INTO sales_orders(order_no,customer_id,warehouse_id,biz_date,freight_cents,"
-            "freight_payer,goods_cents,total_cents,order_status,ship_status,pay_status,pay_time,"
-            "logistics_no,public_token,idempotency_key,note,created_by,created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (order_no, body.customer_id, body.warehouse_id, body.biz_date or now_iso()[:10],
-             freight, body.freight_payer, goods, total, "正常", "未发货", body.pay_status,
-             pay_time, body.logistics_no.strip(), token, body.idempotency_key or None,
-             body.note.strip(), u["username"], now_iso()))
-        oid = cur.lastrowid
-        for pid, qty, up, ltype, lt in lines:
-            c.execute(
-                "INSERT INTO sales_lines(order_id,product_id,qty,unit_price_cents,line_type,line_total_cents)"
-                " VALUES(?,?,?,?,?,?)", (oid, pid, qty, up, ltype, lt))
-            c.execute(
-                "INSERT INTO inventory_txns(txn_type,product_id,batch_id,warehouse_id,qty_delta,"
-                "ref_type,ref_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                ("预定", pid, None, body.warehouse_id, 0, "sales_order", oid, order_no, now_iso()))
-        _sales_event(c, oid, "建单", f"付款状态:{body.pay_status}")
-    return {"id": oid, "order_no": order_no, "public_path": f"/o/{token}", "duplicated": False}
-
-
-@app.get("/api/sales-orders")
-def list_sales(wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    with db() as c:
-        rows = c.execute(
-            "SELECT o.*, cu.name customer_name, w.name warehouse_name FROM sales_orders o "
-            "JOIN customers cu ON cu.id=o.customer_id "
-            "JOIN warehouses w ON w.id=o.warehouse_id ORDER BY o.id DESC LIMIT 200").fetchall()
-        return [_sales_order_dict(c, r) for r in rows]
-
-
-@app.post("/api/sales-orders/{oid}/ship")
-def ship_sales(oid: int, body: ShipIn, wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    with db() as c:
-        o = c.execute("SELECT * FROM sales_orders WHERE id=?", (oid,)).fetchone()
-        if not o:
-            raise HTTPException(404, "货单不存在")
-        if o["order_status"] == "已取消":
-            raise HTTPException(400, "已取消的单不能发货")
-        if o["ship_status"] == "已发货":
-            raise HTTPException(400, "已发货,不能重复发货")
-        lines = c.execute("SELECT * FROM sales_lines WHERE order_id=? ORDER BY id", (oid,)).fetchall()
-        # FIFO: 按批次 biz_date, id 先后扣减该仓库存, 记录实际批次成本
-        for ln in lines:
-            need = ln["qty"]
-            batches = c.execute(
-                "SELECT b.id batch_id, b.total_cost_cents, b.qty_initial, bal.qty bal_qty "
-                "FROM batches b JOIN inventory_balances bal ON bal.batch_id=b.id "
-                "WHERE b.product_id=? AND bal.warehouse_id=? AND bal.qty>0 "
-                "ORDER BY b.biz_date, b.id", (ln["product_id"], o["warehouse_id"])).fetchall()
-            if sum(b["bal_qty"] for b in batches) < need:
-                raise HTTPException(400, "库存不足,无法发货")
-            for b in batches:
-                if need <= 0:
-                    break
-                take = min(need, b["bal_qty"])
-                cost = int((Decimal(take * b["total_cost_cents"]) / Decimal(b["qty_initial"]))
-                           .quantize(Decimal("1"), rounding=ROUND_HALF_UP)) if b["qty_initial"] else 0
-                c.execute(
-                    "UPDATE inventory_balances SET qty=qty-? WHERE batch_id=? AND warehouse_id=? AND qty>=?",
-                    (take, b["batch_id"], o["warehouse_id"], take))
-                c.execute(
-                    "INSERT INTO sales_allocations(order_id,line_id,batch_id,qty,cost_cents,created_at)"
-                    " VALUES(?,?,?,?,?,?)", (oid, ln["id"], b["batch_id"], take, cost, now_iso()))
-                c.execute(
-                    "INSERT INTO inventory_txns(txn_type,product_id,batch_id,warehouse_id,qty_delta,"
-                    "ref_type,ref_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                    ("赠送出库" if ln["line_type"] == "赠送" else "销售出库",
-                     ln["product_id"], b["batch_id"], o["warehouse_id"], -take,
-                     "sales_order", oid, o["order_no"], now_iso()))
-                need -= take
-        ship_time = body.ship_time.strip() or now_iso()
-        c.execute("UPDATE sales_orders SET ship_status='已发货', ship_time=?, logistics_no=? WHERE id=?",
-                  (ship_time, body.logistics_no.strip() or o["logistics_no"], oid))
-        _sales_event(c, oid, "发货", f"物流号:{body.logistics_no.strip() or o['logistics_no']}")
-    return {"ok": True}
-
-
-@app.post("/api/sales-orders/{oid}/cancel")
-def cancel_sales(oid: int, body: CancelIn, wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    with db() as c:
-        o = c.execute("SELECT * FROM sales_orders WHERE id=?", (oid,)).fetchone()
-        if not o:
-            raise HTTPException(404, "货单不存在")
-        if o["order_status"] == "已取消":
-            raise HTTPException(400, "已取消")
-        if o["ship_status"] == "已发货":
-            raise HTTPException(400, "已发货的单不可取消,请走退货(二期)")
-        c.execute("UPDATE sales_orders SET order_status='已取消', cancelled_at=?, cancel_reason=? WHERE id=?",
-                  (now_iso(), body.reason.strip(), oid))
-        for ln in c.execute("SELECT * FROM sales_lines WHERE order_id=?", (oid,)).fetchall():
-            c.execute(
-                "INSERT INTO inventory_txns(txn_type,product_id,batch_id,warehouse_id,qty_delta,"
-                "ref_type,ref_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                ("释放预定", ln["product_id"], None, o["warehouse_id"], 0,
-                 "sales_order", oid, o["order_no"], now_iso()))
-        _sales_event(c, oid, "取消", body.reason.strip())
-    return {"ok": True}
-
-
-@app.post("/api/sales-orders/{oid}/pay-status")
-def set_pay_status(oid: int, body: PayStatusIn, wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    if body.pay_status not in ("已付款", "未付款"):
-        raise HTTPException(400, "付款状态不对")
-    with db() as c:
-        o = c.execute("SELECT * FROM sales_orders WHERE id=?", (oid,)).fetchone()
-        if not o:
-            raise HTTPException(404, "货单不存在")
-        if o["order_status"] == "已取消":
-            raise HTTPException(400, "已取消的单不能改付款状态")
-        pay_time = now_iso() if body.pay_status == "已付款" else None
-        c.execute("UPDATE sales_orders SET pay_status=?, pay_time=? WHERE id=?",
-                  (body.pay_status, pay_time, oid))
-        _sales_event(c, oid, "付款状态", f"{o['pay_status']}->{body.pay_status}")
-    return {"ok": True}
-
-
-@app.put("/api/sales-orders/{oid}")
-def edit_sales(oid: int, body: SalesEditIn, wine_token: Optional[str] = Cookie(default=None)):
-    """改客户货单: 未发货可全改(预定重算, 超可用拒绝); 已发货只可改物流号/备注。"""
-    u = require_user(wine_token)
-    if not body.lines:
-        raise HTTPException(400, "至少一行明细")
-    if body.freight_payer not in ("客户付", "自提无", "我方代付"):
-        raise HTTPException(400, "运费承担方不对")
-    freight = to_cents(body.freight or "0")
-    if body.freight_payer == "自提无":
-        freight = 0
-    lines = []
-    for ln in body.lines:
-        if ln.qty <= 0:
-            raise HTTPException(400, "数量必须大于0")
-        if ln.line_type not in ("销售", "赠送"):
-            raise HTTPException(400, "行类型不对")
-        up = 0 if ln.line_type == "赠送" else to_cents(ln.unit_price or "0")
-        lines.append((ln.product_id, ln.qty, up, ln.line_type, up * ln.qty))
-    goods = sum(x[4] for x in lines)
-    total = goods + (freight if body.freight_payer == "客户付" else 0)
-    with db() as c:
-        o = c.execute("SELECT * FROM sales_orders WHERE id=?", (oid,)).fetchone()
-        if not o:
-            raise HTTPException(404, "货单不存在")
-        if o["order_status"] == "已取消":
-            raise HTTPException(400, "已取消的单不可改")
-        old_lines = c.execute(
-            "SELECT * FROM sales_lines WHERE order_id=? ORDER BY id", (oid,)).fetchall()
-        before = _sales_order_dict(c, o)
-        if o["ship_status"] == "已发货":
-            # 已发货: 除物流号/备注外任何字段变化都拒绝
-            old_key = sorted((x["product_id"], x["qty"], x["unit_price_cents"], x["line_type"])
-                             for x in old_lines)
-            new_key = sorted((p, q, up, t) for p, q, up, t, _ in lines)
-            if (body.customer_id != o["customer_id"] or body.warehouse_id != o["warehouse_id"]
-                    or freight != o["freight_cents"] or body.freight_payer != o["freight_payer"]
-                    or new_key != old_key):
-                raise HTTPException(400, "已发货货单只能改物流号和备注,明细不可改")
-            c.execute("UPDATE sales_orders SET logistics_no=?,note=? WHERE id=?",
-                      (body.logistics_no.strip(), body.note.strip(), oid))
-            _sales_event(c, oid, "修改", "已发货单改物流号/备注")
-            after = _sales_order_dict(
-                c, c.execute("SELECT * FROM sales_orders WHERE id=?", (oid,)).fetchone())
-            log_edit(c, "sales_order", oid, before, after, u["username"])
-            return {"ok": True, "id": oid}
-        # 未发货: 全改, 预定按新明细重算(可用量扣除本单原预定后再校验)
-        if not c.execute("SELECT id FROM customers WHERE id=?", (body.customer_id,)).fetchone():
-            raise HTTPException(400, "客户不存在")
-        if not c.execute("SELECT id FROM warehouses WHERE id=?", (body.warehouse_id,)).fetchone():
-            raise HTTPException(400, "仓库不存在")
-        own_old = {}
-        for x in old_lines:
-            own_old[x["product_id"]] = own_old.get(x["product_id"], 0) + x["qty"]
-        want = {}
-        for pid, qty, *_ in lines:
-            if not c.execute("SELECT id FROM products WHERE id=?", (pid,)).fetchone():
-                raise HTTPException(400, "商品不存在")
-            want[pid] = want.get(pid, 0) + qty
-        for pid, q in want.items():
-            reserved_excl = reserved_qty(c, pid, body.warehouse_id)
-            if body.warehouse_id == o["warehouse_id"]:
-                reserved_excl -= own_old.get(pid, 0)
-            avail = stock_qty(c, pid, body.warehouse_id) - reserved_excl
-            if q > avail:
-                raise HTTPException(400, "可用库存不足,无法预定")
-        c.execute(
-            "UPDATE sales_orders SET customer_id=?,warehouse_id=?,biz_date=?,freight_cents=?,"
-            "freight_payer=?,goods_cents=?,total_cents=?,logistics_no=?,note=? WHERE id=?",
-            (body.customer_id, body.warehouse_id, body.biz_date or o["biz_date"], freight,
-             body.freight_payer, goods, total, body.logistics_no.strip(), body.note.strip(), oid))
-        c.execute("DELETE FROM sales_lines WHERE order_id=?", (oid,))
-        for pid, qty, up, ltype, lt in lines:
-            c.execute(
-                "INSERT INTO sales_lines(order_id,product_id,qty,unit_price_cents,line_type,line_total_cents)"
-                " VALUES(?,?,?,?,?,?)", (oid, pid, qty, up, ltype, lt))
-            c.execute(
-                "INSERT INTO inventory_txns(txn_type,product_id,batch_id,warehouse_id,qty_delta,"
-                "ref_type,ref_id,note,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
-                ("修改预定", pid, None, body.warehouse_id, 0,
-                 "sales_order", oid, o["order_no"], now_iso()))
-        _sales_event(c, oid, "修改", "未发货单改明细/运费/客户")
-        after = _sales_order_dict(
-            c, c.execute("SELECT * FROM sales_orders WHERE id=?", (oid,)).fetchone())
-        log_edit(c, "sales_order", oid, before, after, u["username"])
-    return {"ok": True, "id": oid}
-
-
-# ---------------------------------------------------------------- 公开单页(免登录)
-def _public_order(c, token):
-    o = c.execute(
-        "SELECT o.*, cu.name customer_name, cu.phone customer_phone, cu.address customer_address FROM sales_orders o "
-        "JOIN customers cu ON cu.id=o.customer_id WHERE o.public_token=?", (token,)).fetchone()
+def order_detail(c, table, items_table, oid):
+    o = c.execute(f"SELECT * FROM {table} WHERE id=?", (oid,)).fetchone()
     if not o:
         return None
     d = dict(o)
-    d["lines"] = [dict(x) for x in c.execute(
-        "SELECT l.qty, l.unit_price_cents, l.line_type, l.line_total_cents, "
-        "p.name product_name, p.type product_type, p.vintage, p.origin "
-        "FROM sales_lines l JOIN products p ON p.id=l.product_id WHERE l.order_id=? ORDER BY l.id",
-        (d["id"],))]
+    d["items"] = rows(c, f"SELECT i.*, w.name AS wine_name, w.spec FROM {items_table} i"
+                         " JOIN wines w ON w.id=i.wine_id WHERE i.order_id=?", (oid,))
+    otype = "inbound" if table == "inbound_orders" else "outbound"
+    d["paid_amount"] = paid_total(c, otype, oid)
     return d
 
+@app.get("/api/dashboard")
+async def dashboard(request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    today = date.today().isoformat()
+    month = date.today().strftime("%Y-%m")
+    with conn() as c:
+        sales = c.execute("SELECT COALESCE(SUM(sale_total),0) s FROM outbound_orders"
+                          " WHERE order_date=? AND type='sale'", (today,)).fetchone()["s"]
+        profit = 0.0
+        for it in rows(c, "SELECT i.* FROM outbound_items i JOIN outbound_orders o"
+                          " ON o.id=i.order_id WHERE o.order_date=? AND o.type='sale'", (today,)):
+            profit += (it["unit_price"] - latest_cost(c, it["wine_id"])) * it["qty"]
+        cust_debt = c.execute(
+            "SELECT COALESCE(SUM(sale_total),0) FROM outbound_orders WHERE type='sale'").fetchone()[0] \
+            - c.execute("SELECT COALESCE(SUM(amount),0) FROM payments "
+                        "WHERE order_type='outbound'").fetchone()[0]
+        sup_debt = c.execute(
+            "SELECT COALESCE(SUM(goods_total),0) FROM inbound_orders "
+            "WHERE type='purchase'").fetchone()[0] \
+            - c.execute("SELECT COALESCE(SUM(amount),0) FROM payments "
+                        "WHERE order_type='inbound'").fetchone()[0]
+        low = rows(c, "SELECT w.id, w.name, w.spec, COALESCE(SUM(s.quantity),0) qty"
+                      " FROM wines w LEFT JOIN stock s ON s.wine_id=w.id"
+                      " GROUP BY w.id HAVING qty < ?", (LOW_STOCK_THRESHOLD,))
 
-@app.get("/api/public/orders/{token}")
-def public_order_json(token: str):
-    with db() as c:
-        d = _public_order(c, token)
-    if not d:
-        raise HTTPException(404, "单子不存在")
-    return {k: d[k] for k in ("order_no", "customer_name", "customer_phone", "customer_address", "biz_date", "freight_cents",
-            "freight_payer", "goods_cents", "total_cents", "order_status", "ship_status",
-            "pay_status", "pay_time", "ship_time", "logistics_no", "note", "lines")}
-
-
-@app.get("/o/{token}")
-def public_order_page(token: str):
-    from fastapi.responses import HTMLResponse
-    with db() as c:
-        d = _public_order(c, token)
-    if not d:
-        return HTMLResponse("<h3>单子不存在</h3>", status_code=404)
-
-    def esc(s):
-        return (str(s or "").replace("&", "&amp;").replace("<", "&lt;")
-                .replace(">", "&gt;").replace('"', "&quot;"))
-
-    def m(cents):
-        return f"¥{cents / 100:.2f}"
-
-    rows = "".join(
-        f"<tr><td>{esc(l['product_name'])}{(' ' + esc(l['vintage'])) if l['vintage'] else ''}"
-        f"<div class='s'>{esc(l['product_type'])}{(' · ' + esc(l['origin'])) if l['origin'] else ''}"
-        f"{' · 赠送' if l['line_type'] == '赠送' else ''}</div></td>"
-        f"<td class='n'>{l['qty']}</td><td class='n'>{m(l['unit_price_cents'])}</td>"
-        f"<td class='n'>{m(l['line_total_cents'])}</td></tr>" for l in d["lines"])
-    status = "已取消" if d["order_status"] == "已取消" else f"{d['ship_status']} · {d['pay_status']}"
-    html = f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>货单 {esc(d['order_no'])}</title>
-<style>*{{box-sizing:border-box}}body{{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#f6f6f7;margin:0;color:#1c1c1e}}
-.w{{max-width:640px;margin:0 auto;padding:14px 12px 40px}}.c{{background:#fff;border:1px solid #e4e4e8;border-radius:12px;padding:14px}}
-h1{{font-size:18px;margin:0 0 4px}}.s{{font-size:12px;color:#777}}table{{width:100%;border-collapse:collapse;font-size:14px;margin-top:10px}}
-td,th{{padding:7px 4px;border-bottom:1px solid #f0f0f2;text-align:left}}.n{{text-align:right}}
-.r{{display:flex;justify-content:space-between;padding:5px 0;font-size:14px}}.tot{{font-size:17px;font-weight:700;color:#7a1f2b}}</style></head>
-<body><div class="w"><div class="c"><h1>货单 {esc(d['order_no'])}</h1>
-<div class="s">客户:{esc(d['customer_name'])}{(' · ' + esc(d['customer_phone'])) if d['customer_phone'] else ''} · 状态:{esc(status)}</div>
-{f"<div class='s'>地址:{esc(d['customer_address'])}</div>" if d['customer_address'] else ""}
-<table><tr><th>商品</th><th class="n">数量</th><th class="n">单价</th><th class="n">小计</th></tr>{rows}</table>
-<div class="r"><span>货款</span><span>{m(d['goods_cents'])}</span></div>
-<div class="r"><span>运费({esc(d['freight_payer'])})</span><span>{m(d['freight_cents'])}</span></div>
-<div class="r tot"><span>总计费用</span><span>{m(d['total_cents'])}</span></div>
-<div class="r"><span>物流号</span><span>{esc(d['logistics_no'] or '—')}</span></div>
-<div class="r"><span>发货时间</span><span>{esc((d['ship_time'] or '—').replace('T', ' ')[:16])}</span></div>
-{f"<div class='s'>备注:{esc(d['note'])}</div>" if d['note'] else ""}
-</div></div></body></html>"""
-    return HTMLResponse(html)
+        def month_stat(typ):
+            r = c.execute("SELECT COALESCE(SUM(i.qty),0) q,"
+                          " COALESCE(SUM(i.qty*i.cost_price),0) c FROM outbound_items i"
+                          " JOIN outbound_orders o ON o.id=i.order_id"
+                          " WHERE o.type=? AND substr(o.order_date,1,7)=?",
+                          (typ, month)).fetchone()
+            return int(r["q"]), round(r["c"], 2)
+        pq, pc = month_stat("personal")
+        gq, gc = month_stat("gift")
+        dq, dc = month_stat("damage")
+        month_discount = c.execute(
+            "SELECT COALESCE(SUM(discount_total),0) FROM outbound_orders"
+            " WHERE type='sale' AND substr(order_date,1,7)=?", (month,)).fetchone()[0]
+        return {"today_sales": round(sales, 2), "today_profit": round(profit, 2),
+                "customer_debt": round(cust_debt, 2),
+                "supplier_debt": round(sup_debt, 2),
+                "low_stock": low, "low_threshold": LOW_STOCK_THRESHOLD,
+                "month_personal_qty": pq, "month_personal_cost": pc,
+                "month_gift_qty": gq, "month_gift_cost": gc,
+                "month_damage_qty": dq, "month_damage_cost": dc,
+                "month_discount_total": round(month_discount, 2)}
 
 
-# ---------------------------------------------------------------- 应付/付款
-@app.get("/api/payables")
-def list_payables(wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    with db() as c:
-        rows = c.execute(
-            "SELECT py.*, s.name supplier_name, o.order_no FROM payables py "
-            "JOIN suppliers s ON s.id=py.supplier_id "
-            "JOIN purchase_orders o ON o.id=py.purchase_order_id ORDER BY py.id DESC"
-        ).fetchall()
-        out = []
-        for r in rows:
-            d = dict(r)
-            d["balance_cents"] = d["amount_cents"] - d["paid_cents"]
-            d["payments"] = [dict(x) for x in c.execute(
-                "SELECT * FROM payments WHERE payable_id=? ORDER BY id", (d["id"],))]
-            out.append(d)
-        return out
+@app.post("/api/inbound")
+async def create_inbound(request: Request):
+    """type=purchase 新进货 / opening 补登期初."""
+    u, e = await require_user(request)
+    if e:
+        return e
+    b = await request.json()
+    typ = b.get("type", "purchase")
+    if typ not in ("purchase", "opening"):
+        return err("type 只能是 purchase/opening")
+    items = b.get("items") or []
+    if not items:
+        return err("至少一行商品")
+    freight = 0.0 if b.get("freight_free") else float(b.get("freight") or 0)
+    goods = sum(float(i.get("qty", 0)) * float(i.get("unit_price") or 0)
+                for i in items)
+    with conn() as c:
+        no = next_order_no(c, "inbound_orders", "BD" if typ == "opening" else "RK")
+        cur = c.execute(
+            "INSERT INTO inbound_orders(order_no,type,supplier_id,warehouse_id,"
+            "order_date,carrier,tracking_no,freight,freight_free,freight_payer,"
+            "goods_total,pay_status,note,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (no, typ, b.get("supplier_id"), b.get("warehouse_id"),
+             b.get("order_date") or date.today().isoformat(), b.get("carrier"),
+             b.get("tracking_no"), freight, 1 if b.get("freight_free") else 0,
+             b.get("freight_payer"), round(goods, 2), "unpaid", b.get("note"),
+             datetime.now().isoformat()))
+        oid = cur.lastrowid
+        for i in items:
+            c.execute("INSERT INTO inbound_items(order_id,wine_id,batch,qty,unit_price)"
+                      " VALUES(?,?,?,?,?)",
+                      (oid, i["wine_id"], i.get("batch") or "",
+                       int(i["qty"]), float(i.get("unit_price") or 0)))
+            add_stock(c, b["warehouse_id"], i["wine_id"], i.get("batch") or "",
+                      int(i["qty"]))
+        paid = float(b.get("paid_amount") or 0)
+        if paid > 0:
+            c.execute("INSERT INTO payments(order_type,order_id,amount,pay_date,note,"
+                      "created_at) VALUES('inbound',?,?,?,?,?)",
+                      (oid, paid, date.today().isoformat(), "建单时已付",
+                       datetime.now().isoformat()))
+        c.execute("UPDATE inbound_orders SET pay_status=? WHERE id=?",
+                  (pay_status(paid, goods), oid))
+        audit(c, u["username"], "补登期初" if typ == "opening" else "进货",
+              no, f"货款{goods:.2f} 运费{freight:.2f}")
+        return {"ok": True, "id": oid, "order_no": no, "goods_total": round(goods, 2),
+                "freight": freight}
 
 
-@app.post("/api/payables/{pid}/payments")
-def add_payment(pid: int, body: PaymentIn, wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    amt = to_cents(body.amount)
+@app.get("/api/inbound")
+async def list_inbound(request: Request, type: str = "", supplier_id: str = "",
+                       date_from: str = "", date_to: str = ""):
+    u, e = await require_user(request)
+    if e:
+        return e
+    q, args = "SELECT * FROM inbound_orders WHERE 1=1", []
+    if type:
+        q += " AND type=?"; args.append(type)
+    if supplier_id:
+        q += " AND supplier_id=?"; args.append(supplier_id)
+    if date_from:
+        q += " AND order_date>=?"; args.append(date_from)
+    if date_to:
+        q += " AND order_date<=?"; args.append(date_to)
+    with conn() as c:
+        ds = rows(c, q + " ORDER BY id DESC", args)
+        for d in ds:
+            d["paid_amount"] = paid_total(c, "inbound", d["id"])
+        return ds
+
+
+@app.get("/api/inbound/{oid}")
+async def get_inbound(oid: int, request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        d = order_detail(c, "inbound_orders", "inbound_items", oid)
+        return d or err("单据不存在", 404)
+
+
+@app.post("/api/outbound")
+async def create_outbound(request: Request):
+    """type=sale 销售出库 / personal 自饮 / gift 赠送 / damage 破损.
+    非销售: 不算收入、不产生应收, 按成本价记成本. 折扣只针对销售出库."""
+    u, e = await require_user(request)
+    if e:
+        return e
+    b = await request.json()
+    typ = b.get("type", "sale")
+    if typ not in ("sale", "personal", "gift", "damage"):
+        return err("type 只能是 sale/personal/gift/damage")
+    items = b.get("items") or []
+    if not items:
+        return err("至少一行商品")
+    if typ == "gift" and not b.get("customer_id"):
+        return err("赠送必须选择受赠客户")
+    if typ in ("personal", "damage") and b.get("customer_id"):
+        return err("自饮/破损不需要客户")
+    wh = b.get("warehouse_id")
+    with conn() as c:
+        for i in items:  # 先校验全部, 不足拦住, 不允许负库存
+            have = get_stock(c, wh, i["wine_id"], i.get("batch") or "")
+            if int(i["qty"]) > have:
+                w = c.execute("SELECT name FROM wines WHERE id=?",
+                              (i["wine_id"],)).fetchone()
+                return err(f"库存不足: {w['name'] if w else i['wine_id']} "
+                           f"现有 {have} 瓶, 要出 {i['qty']} 瓶")
+        # 逐行算价: 销售可用折扣 (折扣率或折后单价二选一); 非销售按成本价记成本
+        lines = []
+        for i in items:
+            qty = int(i["qty"])
+            cost = latest_cost(c, i["wine_id"])
+            orig = float(i.get("orig_price") or i.get("unit_price") or 0)
+            rate = i.get("discount_rate")
+            dprice = i.get("discount_price")
+            if rate in ("", None):
+                rate = None
+            if dprice in ("", None):
+                dprice = None
+            reason = (i.get("reason") or "").strip()
+            if typ == "sale":
+                if rate is not None or dprice is not None:
+                    if not reason and not (b.get("note") or "").strip():
+                        return err("打折需填写瑕疵/打折原因")
+                    if rate is not None:
+                        rate = float(rate)
+                        if not 0 < rate <= 1:
+                            return err("折扣率须在 0 到 1 之间 (如 0.9 为 9 折)")
+                        final = round(orig * rate, 2)
+                    else:
+                        final = float(dprice)
+                        if final < 0 or final > orig:
+                            return err("折后单价须在 0 到原价之间")
+                        rate = round(final / orig, 4) if orig else None
+                    disc = round((orig - final) * qty, 2)
+                else:
+                    rate, final, disc = None, orig, 0.0
+                lines.append({"wine_id": i["wine_id"], "batch": i.get("batch") or "",
+                              "qty": qty, "unit_price": final, "orig_price": orig,
+                              "discount_rate": rate, "discount_amount": disc,
+                              "cost_price": cost, "reason": reason or None})
+            else:
+                lines.append({"wine_id": i["wine_id"], "batch": i.get("batch") or "",
+                              "qty": qty, "unit_price": 0.0, "orig_price": 0.0,
+                              "discount_rate": None, "discount_amount": 0.0,
+                              "cost_price": cost, "reason": reason or None})
+        if typ == "sale":
+            freight = 0.0 if b.get("freight_free") else float(b.get("freight") or 0)
+            total = round(sum(l["qty"] * l["unit_price"] for l in lines), 2)
+            orig_total = round(sum(l["qty"] * l["orig_price"] for l in lines), 2)
+            disc_total = round(sum(l["discount_amount"] for l in lines), 2)
+        else:
+            freight, total, orig_total, disc_total = 0.0, 0.0, 0.0, 0.0
+        cost_total = round(sum(l["qty"] * l["cost_price"] for l in lines), 2)
+        no = next_order_no(c, "outbound_orders", "CK")
+        cur = c.execute(
+            "INSERT INTO outbound_orders(order_no,type,customer_id,warehouse_id,"
+            "order_date,carrier,tracking_no,freight,freight_free,freight_payer,"
+            "sale_total,orig_total,discount_total,cost_total,pay_status,note,created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (no, typ, b.get("customer_id") if typ in ("sale", "gift") else None,
+             wh, b.get("order_date") or date.today().isoformat(),
+             b.get("carrier"), b.get("tracking_no"), freight,
+             1 if b.get("freight_free") else 0, b.get("freight_payer"),
+             total, orig_total, disc_total, cost_total,
+             "unpaid" if typ == "sale" else "paid",
+             b.get("note"), datetime.now().isoformat()))
+        oid = cur.lastrowid
+        for l in lines:
+            c.execute("INSERT INTO outbound_items(order_id,wine_id,batch,qty,unit_price,"
+                      "orig_price,discount_rate,discount_amount,cost_price,reason)"
+                      " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                      (oid, l["wine_id"], l["batch"], l["qty"], l["unit_price"],
+                       l["orig_price"], l["discount_rate"], l["discount_amount"],
+                       l["cost_price"], l["reason"]))
+            add_stock(c, wh, l["wine_id"], l["batch"], -l["qty"])
+        paid = float(b.get("paid_amount") or 0) if typ == "sale" else 0.0
+        if paid > 0:
+            c.execute("INSERT INTO payments(order_type,order_id,amount,pay_date,note,"
+                      "created_at) VALUES('outbound',?,?,?,?,?)",
+                      (oid, paid, date.today().isoformat(), "建单时已收",
+                       datetime.now().isoformat()))
+        if typ == "sale":
+            c.execute("UPDATE outbound_orders SET pay_status=? WHERE id=?",
+                      (pay_status(paid, total), oid))
+        action = {"sale": "出货", "personal": "自饮", "gift": "赠送",
+                  "damage": "破损"}[typ]
+        note = (f"货款{total:.2f} 运费{freight:.2f}" if typ == "sale"
+                else f"成本{cost_total:.2f} {sum(l['qty'] for l in lines)} 瓶")
+        if disc_total:
+            note += f" 折扣{disc_total:.2f}"
+        audit(c, u["username"], action, no, note)
+        return {"ok": True, "id": oid, "order_no": no, "type": typ,
+                "sale_total": total, "orig_total": orig_total,
+                "discount_total": disc_total, "cost_total": cost_total,
+                "pay_status": pay_status(paid, total) if typ == "sale" else "paid",
+                "freight": freight}
+
+
+@app.get("/api/outbound")
+async def list_outbound(request: Request, customer_id: str = "",
+                        type: str = "", date_from: str = "", date_to: str = ""):
+    u, e = await require_user(request)
+    if e:
+        return e
+    q, args = "SELECT * FROM outbound_orders WHERE 1=1", []
+    if customer_id:
+        q += " AND customer_id=?"; args.append(customer_id)
+    if type:
+        q += " AND type=?"; args.append(type)
+    if date_from:
+        q += " AND order_date>=?"; args.append(date_from)
+    if date_to:
+        q += " AND order_date<=?"; args.append(date_to)
+    with conn() as c:
+        ds = rows(c, q + " ORDER BY id DESC", args)
+        for d in ds:
+            d["paid_amount"] = paid_total(c, "outbound", d["id"])
+        return ds
+
+
+@app.get("/api/outbound/{oid}")
+async def get_outbound(oid: int, request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        d = order_detail(c, "outbound_orders", "outbound_items", oid)
+        return d or err("单据不存在", 404)
+
+
+@app.get("/api/customers/{cid}/gifts")
+async def customer_gifts(cid: int, request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        cus = c.execute("SELECT * FROM customers WHERE id=?", (cid,)).fetchone()
+        if not cus:
+            return err("客户不存在", 404)
+        tot = c.execute("SELECT COALESCE(SUM(i.qty),0) q,"
+                        " COALESCE(SUM(i.qty*i.cost_price),0) c FROM outbound_items i"
+                        " JOIN outbound_orders o ON o.id=i.order_id"
+                        " WHERE o.type='gift' AND o.customer_id=?", (cid,)).fetchone()
+        by_wine = rows(c, "SELECT w.id AS wine_id, w.name AS wine_name,"
+                          " COALESCE(SUM(i.qty),0) qty,"
+                          " COALESCE(SUM(i.qty*i.cost_price),0) cost"
+                          " FROM outbound_items i JOIN outbound_orders o ON o.id=i.order_id"
+                          " JOIN wines w ON w.id=i.wine_id"
+                          " WHERE o.type='gift' AND o.customer_id=? GROUP BY w.id", (cid,))
+        orders = rows(c, "SELECT o.*, COALESCE(SUM(i.qty),0) qty FROM outbound_orders o"
+                         " LEFT JOIN outbound_items i ON i.order_id=o.id"
+                         " WHERE o.type='gift' AND o.customer_id=?"
+                         " GROUP BY o.id ORDER BY o.id DESC", (cid,))
+        return {"customer": dict(cus), "total_qty": int(tot["q"]),
+                "total_cost": round(tot["c"], 2), "by_wine": by_wine, "orders": orders}
+
+
+@app.post("/api/orders/{otype}/{oid}/payments")
+async def add_payment(otype: str, oid: int, request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    if otype not in ("inbound", "outbound"):
+        return err("otype 只能是 inbound/outbound")
+    b = await request.json()
+    amt = float(b.get("amount") or 0)
     if amt <= 0:
-        raise HTTPException(400, "付款金额必须大于0")
-    with db() as c:
-        pay = c.execute("SELECT * FROM payables WHERE id=?", (pid,)).fetchone()
-        if not pay:
-            raise HTTPException(404, "应付不存在")
-        if pay["paid_cents"] + amt > pay["amount_cents"]:
-            raise HTTPException(400, "付款超过应付余额")
-        c.execute(
-            "INSERT INTO payments(payable_id,supplier_id,amount_cents,pay_date,note,created_at)"
-            " VALUES(?,?,?,?,?,?)",
-            (pid, pay["supplier_id"], amt, body.pay_date, body.note.strip(), now_iso()))
-        c.execute("UPDATE payables SET paid_cents=paid_cents+? WHERE id=?", (amt, pid))
-        row = c.execute("SELECT amount_cents,paid_cents FROM payables WHERE id=?", (pid,)).fetchone()
-    return {"ok": True, "balance": yuan(row["amount_cents"] - row["paid_cents"])}
+        return err("金额必须大于 0")
+    table = "inbound_orders" if otype == "inbound" else "outbound_orders"
+    total_field = "goods_total" if otype == "inbound" else "sale_total"
+    with conn() as c:
+        o = c.execute(f"SELECT * FROM {table} WHERE id=?", (oid,)).fetchone()
+        if not o:
+            return err("单据不存在", 404)
+        if otype == "outbound" and o["type"] != "sale":
+            return err("自饮/赠送/破损单不产生应收, 不能补记收款")
+        c.execute("INSERT INTO payments(order_type,order_id,amount,pay_date,note,"
+                  "created_at) VALUES(?,?,?,?,?,?)",
+                  (otype, oid, amt, b.get("pay_date") or date.today().isoformat(),
+                   b.get("note"), datetime.now().isoformat()))
+        paid = paid_total(c, otype, oid)
+        c.execute(f"UPDATE {table} SET pay_status=? WHERE id=?",
+                  (pay_status(paid, o[total_field]), oid))
+        audit(c, u["username"], "收款" if otype == "outbound" else "付款",
+              o["order_no"], f"补记 {amt:.2f}")
+        return {"ok": True, "paid_amount": paid,
+                "pay_status": pay_status(paid, o[total_field])}
 
 
-@app.put("/api/payments/{payid}")
-def edit_payment(payid: int, body: PaymentIn, wine_token: Optional[str] = Cookie(default=None)):
-    """改付款记录(金额/日期/备注): 已付总额重算, 不得超过应付总额。"""
-    u = require_user(wine_token)
-    amt = to_cents(body.amount)
-    if amt <= 0:
-        raise HTTPException(400, "付款金额必须大于0")
-    with db() as c:
-        old = c.execute("SELECT * FROM payments WHERE id=?", (payid,)).fetchone()
-        if not old:
-            raise HTTPException(404, "付款记录不存在")
-        pay = c.execute("SELECT * FROM payables WHERE id=?", (old["payable_id"],)).fetchone()
-        if not pay:
-            raise HTTPException(404, "应付不存在")
-        new_paid = pay["paid_cents"] - old["amount_cents"] + amt
-        if new_paid > pay["amount_cents"]:
-            raise HTTPException(400, "付款总额超过应付总额")
-        c.execute("UPDATE payments SET amount_cents=?,pay_date=?,note=? WHERE id=?",
-                  (amt, body.pay_date, body.note.strip(), payid))
-        c.execute("UPDATE payables SET paid_cents=? WHERE id=?", (new_paid, pay["id"]))
-        new = c.execute("SELECT * FROM payments WHERE id=?", (payid,)).fetchone()
-        log_edit(c, "payment", payid, dict(old), dict(new), u["username"])
-    return {"ok": True, "balance": yuan(pay["amount_cents"] - new_paid)}
+@app.post("/api/transfers")
+async def create_transfer(request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    b = await request.json()
+    qty = int(b.get("qty") or 0)
+    if qty <= 0:
+        return err("数量必须大于 0")
+    if b.get("from_warehouse_id") == b.get("to_warehouse_id"):
+        return err("调出和调入仓库不能相同")
+    with conn() as c:
+        have = get_stock(c, b["from_warehouse_id"], b["wine_id"], b.get("batch") or "")
+        if qty > have:
+            return err(f"源仓库存不足, 现有 {have} 瓶")
+        no = next_order_no(c, "transfers", "DB", col="transfer_no")
+        c.execute("INSERT INTO transfers(transfer_no,from_warehouse_id,"
+                  "to_warehouse_id,wine_id,batch,qty,created_at,note)"
+                  " VALUES(?,?,?,?,?,?,?,?)",
+                  (no, b["from_warehouse_id"], b["to_warehouse_id"], b["wine_id"],
+                   b.get("batch") or "", qty, datetime.now().isoformat(),
+                   b.get("note")))
+        add_stock(c, b["from_warehouse_id"], b["wine_id"], b.get("batch") or "", -qty)
+        add_stock(c, b["to_warehouse_id"], b["wine_id"], b.get("batch") or "", qty)
+        audit(c, u["username"], "调拨", no, f"{qty} 瓶")
+        return {"ok": True, "transfer_no": no}
 
 
-# ---------------------------------------------------------------- 修改记录
-@app.get("/api/edit-logs")
-def list_edit_logs(entity_type: str = "", entity_id: int = 0,
-                   wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    with db() as c:
-        q = "SELECT * FROM edit_logs WHERE 1=1"
-        args = []
-        if entity_type:
-            q += " AND entity_type=?"
-            args.append(entity_type)
-        if entity_id:
-            q += " AND entity_id=?"
-            args.append(entity_id)
-        q += " ORDER BY id DESC LIMIT 200"
-        return [dict(r) for r in c.execute(q, args)]
+@app.get("/api/transfers")
+async def list_transfers(request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        return rows(c, "SELECT t.*, w.name AS wine_name FROM transfers t"
+                       " JOIN wines w ON w.id=t.wine_id ORDER BY t.id DESC")
 
 
-# ---------------------------------------------------------------- 备份
-@app.post("/api/backup")
-def backup(wine_token: Optional[str] = Cookie(default=None)):
-    require_user(wine_token)
-    bdir = DATA_DIR / "backups"
-    bdir.mkdir(parents=True, exist_ok=True)
-    name = f"wine-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.db"
-    src = connect()
-    dst = sqlite3.connect(bdir / name)
-    with dst:
-        src.backup(dst)
-    dst.close()
-    src.close()
-    return {"ok": True, "file": name, "path": str(bdir / name)}
+@app.get("/api/stock")
+async def list_stock(request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        return rows(c, "SELECT s.*, w.name AS wine_name, wh.name AS warehouse_name"
+                       " FROM stock s JOIN wines w ON w.id=s.wine_id"
+                       " JOIN warehouses wh ON wh.id=s.warehouse_id"
+                       " WHERE s.quantity>0 ORDER BY w.name")
+
+# ---------- 分享图 ----------
+def render_share_png(lines, title):
+    from PIL import Image, ImageDraw, ImageFont
+    W = 1080
+    H = 120 + 64 * len(lines) + 80
+    img = Image.new("RGB", (W, H), "white")
+    d = ImageDraw.Draw(img)
+    import glob
+    cjk = (glob.glob("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.*")
+           + glob.glob("/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.*")
+           + glob.glob(str(BASE_DIR / "static" / "fonts" / "NotoSansSC*")))
+    dejavu = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+    dejavu_b = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+    f_body_path = cjk[0] if cjk else dejavu
+    f_title_path = cjk[0] if cjk else dejavu_b
+    try:
+        f_title = ImageFont.truetype(f_title_path, 52)
+        f_body = ImageFont.truetype(f_body_path, 40)
+    except Exception:
+        f_title = ImageFont.load_default()
+        f_body = ImageFont.load_default()
+    d.text((60, 30), title, fill="black", font=f_title)
+    d.line([(60, 110), (W - 60, 110)], fill="black", width=3)
+    y = 140
+    for line in lines:
+        d.text((60, y), line, fill="black", font=f_body)
+        y += 64
+    buf = BytesIO()
+    img.save(buf, "PNG")
+    return buf.getvalue()
+
+
+@app.get("/api/orders/{otype}/{oid}/share.png")
+async def share_png(otype: str, oid: int, request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        if otype == "outbound":
+            d = order_detail(c, "outbound_orders", "outbound_items", oid)
+            if not d:
+                return err("单据不存在", 404)
+            if (d.get("type") or "sale") != "sale":
+                return err("自饮/赠送/破损单不需要分享图", 400)
+            cust = c.execute("SELECT name FROM customers WHERE id=?",
+                             (d["customer_id"],)).fetchone()
+            lines = [f"单号: {d['order_no']}", f"日期: {d['order_date']}",
+                     f"客户: {cust['name'] if cust else ''}"]
+            for it in d["items"]:
+                if (it.get("discount_amount") or 0) > 0:
+                    lines.append(f"{it['wine_name']} {it.get('spec') or ''} x{it['qty']} "
+                                 f"原价{it['orig_price']:.2f} 折后{it['unit_price']:.2f} "
+                                 f"折扣{it['discount_amount']:.2f} 小计{it['qty']*it['unit_price']:.2f}")
+                else:
+                    lines.append(f"{it['wine_name']} {it.get('spec') or ''} x{it['qty']} "
+                                 f"单价{it['unit_price']:.2f} 小计{it['qty']*it['unit_price']:.2f}")
+            total = d["sale_total"]
+            lines += [f"货款合计: {total:.2f} 元"]
+            if (d.get("discount_total") or 0) > 0:
+                lines.append(f"其中折扣: {d['discount_total']:.2f} 元"
+                             f" (原价合计 {d.get('orig_total') or 0:.2f} 元)")
+                reasons = sorted({(it.get("reason") or "") for it in d["items"]
+                                  if it.get("reason")})
+                if reasons:
+                    lines.append("折扣原因: " + "、".join(reasons))
+            lines += [f"物流: {d.get('carrier') or ''} {d.get('tracking_no') or ''} "
+                      f"运费{d['freight']:.2f} 元",
+                      f"已付: {d['paid_amount']:.2f} 元  还欠: {max(total-d['paid_amount'],0):.2f} 元"]
+            return Response(render_share_png(lines, "出货单"), media_type="image/png")
+        if otype == "inbound":
+            d = order_detail(c, "inbound_orders", "inbound_items", oid)
+            if not d:
+                return err("单据不存在", 404)
+            sup = c.execute("SELECT name FROM suppliers WHERE id=?",
+                            (d["supplier_id"],)).fetchone()
+            kind = "补登单" if d["type"] == "opening" else "进货单"
+            lines = [f"单号: {d['order_no']}", f"日期: {d['order_date']}",
+                     f"供应商: {sup['name'] if sup else ''}"]
+            for it in d["items"]:
+                lines.append(f"{it['wine_name']} {it.get('spec') or ''} x{it['qty']} "
+                             f"单价{it['unit_price']:.2f} 小计{it['qty']*it['unit_price']:.2f}")
+            total = d["goods_total"]
+            lines += [f"货款合计: {total:.2f} 元",
+                      f"物流: {d.get('carrier') or ''} {d.get('tracking_no') or ''} "
+                      f"运费{d['freight']:.2f} 元",
+                      f"已付: {d['paid_amount']:.2f} 元  还欠: {max(total-d['paid_amount'],0):.2f} 元"]
+            return Response(render_share_png(lines, kind), media_type="image/png")
+        return err("otype 只能是 inbound/outbound")
+
+
+app.mount("/uploads", StaticFiles(directory=str(UPLOAD_DIR)), name="uploads")
+app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
+
+if __name__ == "__main__":
+    import uvicorn
+    init_db()
+    # 端口定为 9000（Tristan 确认）；可用环境变量 PORT 覆盖，不用改代码
+    port = int(os.environ.get("PORT", "9000"))
+    uvicorn.run(app, host="127.0.0.1", port=port)
