@@ -74,11 +74,11 @@ def main():
         s, _ = req("GET", "/api/wines")
         check("未登录调业务接口返回 401", s == 401, f"status={s}")
 
-        # 1b. 版本接口公开返回 v2.9.0（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
+        # 1b. 版本接口公开返回 v2.10.0（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
         s, d = req("GET", "/api/version")
-        check("版本接口 /api/version 返回 v2.9.0", s == 200 and d.get("version") == "v2.9.0", f"status={s} {d}")
+        check("版本接口 /api/version 返回 v2.10.0", s == 200 and d.get("version") == "v2.10.0", f"status={s} {d}")
         s, d = req("GET", "/api/config")
-        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.9.0" and "build_date" in d, f"status={s} {d}")
+        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.10.0" and "build_date" in d, f"status={s} {d}")
 
         # 2. 无默认用户: 首位注册前注册开放, 默认账号登录失败
         s, d = req("GET", "/api/auth/status")
@@ -1309,30 +1309,52 @@ def main():
 
         # 26. v2.9.0: 单据页分未结单 / 已结单
         # 前端 ordSettled/ordTypeOf 的同规则镜像 (见 static/index.html):
-        # 未结单 = 还有货没确认完; 已结单 = 已全部确认/已作废/已关闭;
-        # 立即生效的单 (补登/自饮/赠送/破损) 下单即已结.
+        # v2.10.0 双口径: 未结单 = 货没走完 或 欠款 > 0; 已结单 = 货走完 且 欠款 = 0;
+        # 已作废永远进已结单, 已关闭按欠款算; 立即生效的单 (补登/自饮/赠送/破损)
+        # 下单即已结; 欠款按卡片口径算, 比较前按分四舍五入.
         def _totals(o):
             q = sum(i["qty"] for i in o.get("items") or [])
             cq = sum(i.get("confirmed_qty") or 0 for i in o.get("items") or [])
             return q, cq
+
+        def _owed(kind, o):
+            # 卡片欠款口径的镜像 (与前端 ordOwed 一致): 已确认金额 + 应计运费
+            # - 已退 - 已付, 按分四舍五入后下限为 0; 调拨/退货/非销售出库没有钱
+            if kind in ("transfers", "returns"):
+                return 0
+            if kind == "outbound" and o.get("type") != "sale":
+                return 0
+            sale = o.get("type") == "sale"
+            conf = sum((i.get("confirmed_qty") or 0) * (i.get("unit_price") or 0)
+                       for i in o.get("items") or [])
+            cq = sum(i.get("confirmed_qty") or 0 for i in o.get("items") or [])
+            freight = (o.get("freight") or 0) if (sale and o.get("freight_rule")
+                                                 and not o.get("freight_free")
+                                                 and cq > 0) else 0
+            tot = conf + freight - (o.get("returned_amount") or 0)
+            return max(round(tot - (o.get("paid_amount") or 0), 2), 0)
 
         def _settled(kind, o):
             if o.get("voided"):
                 return True
             if kind == "transfers":
                 return o.get("status") == "done"
-            if o.get("status") == "closed":
-                return True
             if kind == "inbound" and o.get("type") == "opening":
                 return True
             if kind == "outbound" and o.get("type") != "sale":
                 return True
+            if kind == "returns":
+                q, cq = _totals(o)
+                return o.get("status") == "closed" or (q > 0 and cq >= q)
             q, cq = _totals(o)
-            return q > 0 and cq >= q
+            goods_done = o.get("status") == "closed" or (q > 0 and cq >= q)
+            return goods_done and _owed(kind, o) <= 0
 
         def _otype(kind, o):
             if kind == "transfers":
                 return "transfer"
+            if kind == "returns":
+                return "outbound" if o.get("kind") == "sale" else "purchase"
             if kind == "inbound":
                 return "opening" if o.get("type") == "opening" else "purchase"
             return "outbound"
@@ -1341,7 +1363,9 @@ def main():
             _, ib = req("GET", "/api/inbound", token=tok)
             _, ob = req("GET", "/api/outbound", token=tok)
             _, tr = req("GET", "/api/transfers", token=tok)
-            return {"inbound": ib, "outbound": ob, "transfers": tr}
+            _, rt = req("GET", "/api/returns", token=tok)
+            return {"inbound": ib, "outbound": ob, "transfers": tr,
+                    "returns": rt}
 
         def _in_view(oid, kind, view, otype=""):
             for k, lst in _all_lists().items():
@@ -1380,7 +1404,13 @@ def main():
               and not _in_view(in26, "inbound", "closed"), f"status={s} {d}")
         s, d = req("POST", f"/api/inbound/{in26}/confirm", {}, token=tok)
         check("进货单确认成功", s == 200, f"status={s} {d}")
-        check("全部确认后只在已结单/进货单",
+        check("全部确认未付款仍留在未结单 (双口径: 钱没付清)",
+              _in_view(in26, "inbound", "open")
+              and not _in_view(in26, "inbound", "closed"), f"status={s} {d}")
+        s, d = req("POST", f"/api/orders/inbound/{in26}/payments",
+                   {"amount": 240}, token=tok)
+        check("进货单补记付款到付清", s == 200, f"status={s} {d}")
+        check("付清后只在已结单/进货单",
               _in_view(in26, "inbound", "closed", "purchase")
               and not _in_view(in26, "inbound", "open")
               and not _in_view(in26, "inbound", "closed", "opening"),
@@ -1404,13 +1434,19 @@ def main():
         s, d = req("POST", f"/api/orders/inbound/{in26b}/void", {}, token=tok)
         check("部分确认后废剩余成功变已关闭",
               s == 200 and d.get("status") == "closed", f"status={s} {d}")
-        check("废剩余后进已结单/进货单",
-              _in_view(in26b, "inbound", "closed", "purchase")
-              and not _in_view(in26b, "inbound", "open"), f"status={s} {d}")
+        check("废剩余后仍在未结单 (已确认部分有欠款)",
+              _in_view(in26b, "inbound", "open")
+              and not _in_view(in26b, "inbound", "closed"), f"status={s} {d}")
         s, db2 = req("GET", "/api/dashboard", token=tok)
         check("关闭后已确认部分的欠款保留 (废剩余前后供应商欠款不变)",
               db2.get("supplier_debt") == sup_d1,
               f"d1={sup_d1} d2={db2.get('supplier_debt')}")
+        s, d = req("POST", f"/api/orders/inbound/{in26b}/payments",
+                   {"amount": 120}, token=tok)
+        check("关闭的单补记付款到付清", s == 200, f"status={s} {d}")
+        check("付清后进已结单/进货单",
+              _in_view(in26b, "inbound", "closed", "purchase")
+              and not _in_view(in26b, "inbound", "open"), f"status={s} {d}")
         s, d = req("POST", f"/api/inbound/{in26b}/confirm", {}, token=tok)
         check("已关闭的单再确认被拒 400", s == 400, f"status={s} {d}")
 
@@ -1438,7 +1474,13 @@ def main():
               and not _in_view(out26, "outbound", "closed"), f"status={s} {d}")
         s, d = req("POST", f"/api/outbound/{out26}/confirm", {}, token=tok)
         check("出货单确认成功", s == 200, f"status={s} {d}")
-        check("确认出货后只在已结单/出货单",
+        check("确认出货后未付款仍留在未结单 (双口径: 钱没付清)",
+              _in_view(out26, "outbound", "open")
+              and not _in_view(out26, "outbound", "closed"), f"status={s} {d}")
+        s, d = req("POST", f"/api/orders/outbound/{out26}/payments",
+                   {"amount": 200}, token=tok)
+        check("出货单补记收款到付清", s == 200, f"status={s} {d}")
+        check("付清后只在已结单/出货单",
               _in_view(out26, "outbound", "closed", "outbound")
               and not _in_view(out26, "outbound", "open"), f"status={s} {d}")
 
@@ -1489,7 +1531,13 @@ def main():
               f"d1={cus_d1} d2={db2.get('customer_debt')}")
         s, d = req("POST", f"/api/outbound/{out26b}/confirm", {}, token=tok)
         check("已关闭的出货单再确认被拒 400", s == 400, f"status={s} {d}")
-        check("废剩余后出货单进已结单/出货单",
+        check("废剩余后仍在未结单 (已确认部分有欠款)",
+              _in_view(out26b, "outbound", "open")
+              and not _in_view(out26b, "outbound", "closed"), f"status={s} {d}")
+        s, d = req("POST", f"/api/orders/outbound/{out26b}/payments",
+                   {"amount": 200}, token=tok)
+        check("关闭的出货单补记收款到付清", s == 200, f"status={s} {d}")
+        check("付清后进已结单/出货单",
               _in_view(out26b, "outbound", "closed", "outbound")
               and not _in_view(out26b, "outbound", "open"), f"status={s} {d}")
 
@@ -1506,8 +1554,8 @@ def main():
               "进货/补登单" not in html and "loadOrders('inbound')" not in html
               and "loadOrders('outbound')" not in html
               and "loadOrders('transfers')" not in html, f"status={s}")
-        check("分类逻辑在场 (ordSettled/ordTypeOf/setOrdView/setOrdType)",
-              "ordSettled" in html and "ordTypeOf" in html
+        check("分类逻辑在场 (ordSettled/ordOwed/ordTypeOf/setOrdView/setOrdType)",
+              "ordSettled" in html and "ordOwed" in html and "ordTypeOf" in html
               and "setOrdView" in html and "setOrdType" in html, f"status={s}")
         check("未结单也有类型筛选 (全部/进货/出货/调仓, 无补货)",
               'id="ord-type-row-open"' in html and 'id="ord-open-all"' in html
@@ -1522,6 +1570,412 @@ def main():
               and "badge bad" in html, f"status={s}")
         check("出货单卡片显示业务类型 (销售/自饮/赠送/破损)",
               "o.type==='sale'?'销售'" in html, f"status={s}")
+
+        # 27. v2.10.0: 双口径分类、退货/纠错、防超卖、备份恢复
+        s, d = req("POST", "/api/warehouses", {"name": "退货仓"}, token=tok)
+        wh_ret = d.get("id")
+        check("建退货仓", s == 200 and wh_ret, f"status={s} {d}")
+
+        def _stock(wid, wine):
+            _, _rows = req("GET", "/api/stock", token=tok)
+            for _r in _rows:
+                if _r["warehouse_id"] == wid and _r["wine_id"] == wine:
+                    return _r["quantity"]
+            return 0
+
+        def _debt():
+            _, _db = req("GET", "/api/dashboard", token=tok)
+            return _db.get("customer_debt"), _db.get("supplier_debt")
+
+        # 27a. 销售退货全流程
+        s, w = req("POST", "/api/wines",
+                   {"barcode": "6901234567898", "name": "退货测试酒",
+                    "capacity_ml": 750, "sale_price": 200}, token=tok)
+        wid_r = w.get("id")
+        check("建退货测试酒", s == 200 and wid_r, f"status={s} {w}")
+        s, d = req("POST", "/api/inbound",
+                   {"type": "opening", "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_r, "qty": 30, "unit_price": 100}]},
+                   token=tok)
+        check("退货测试酒补登 30 瓶", s == 200, f"status={s} {d}")
+        s, d = req("POST", "/api/outbound",
+                   {"customer_id": cus, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_r, "qty": 10, "unit_price": 200}]},
+                   token=tok)
+        out_r = d.get("id")
+        check("建销售单 10 瓶", s == 200 and out_r, f"status={s} {d}")
+        s, d = req("POST", f"/api/outbound/{out_r}/confirm", {}, token=tok)
+        check("销售单确认成功", s == 200, f"status={s} {d}")
+        check("确认后主仓剩 20 瓶", _stock(wh1, wid_r) == 20,
+              f"stock={_stock(wh1, wid_r)}")
+        cd0, _ = _debt()
+        s, d = req("GET", f"/api/outbound/{out_r}", token=tok)
+        item_r = d["items"][0]["id"]
+        s, d = req("POST", "/api/returns",
+                   {"kind": "sale", "orig_order_id": out_r,
+                    "warehouse_id": wh_ret, "reason": "客户不要了",
+                    "items": [{"orig_item_id": item_r, "qty": 4,
+                               "disposition": "normal"}]}, token=tok)
+        ret_r = d.get("id")
+        check("建销售退货单 4 瓶", s == 200 and ret_r, f"status={s} {d}")
+        check("退货单在未结单/出货单",
+              _in_view(ret_r, "returns", "open")
+              and not _in_view(ret_r, "returns", "closed"), f"status={s} {d}")
+        s, d = req("POST", "/api/returns",
+                   {"kind": "sale", "orig_order_id": out_r,
+                    "warehouse_id": wh_ret, "reason": "多退",
+                    "items": [{"orig_item_id": item_r, "qty": 7,
+                               "disposition": "normal"}]}, token=tok)
+        check("超量退货被拒 400", s == 400 and "可退" in str(d),
+              f"status={s} {d}")
+        s, d = req("GET", f"/api/returns/{ret_r}", token=tok)
+        ritem_r = d["items"][0]["id"]
+        check("退货单明细关联原行、退货价冻结原行折后价",
+              d["items"][0].get("orig_item_id") == item_r
+              and d["items"][0].get("unit_price") == 200, f"status={s} {d}")
+        s, d = req("POST", f"/api/returns/{ret_r}/confirm",
+                   {"items": [{"item_id": ritem_r, "qty": 2}]}, token=tok)
+        check("退货部分确认成功", s == 200 and d.get("status") == "partial",
+              f"status={s} {d}")
+        check("正常退货副仓 +2 瓶", _stock(wh_ret, wid_r) == 2,
+              f"stock={_stock(wh_ret, wid_r)}")
+        cd1, _ = _debt()
+        check("退货确认后客户欠款减少 400", cd1 == cd0 - 400,
+              f"d0={cd0} d1={cd1}")
+        s, d = req("GET", f"/api/outbound/{out_r}", token=tok)
+        check("原单行显示已退 2 瓶",
+              d["items"][0].get("returned_qty") == 2, f"status={s} {d}")
+        s, d = req("POST", f"/api/returns/{ret_r}/confirm", {}, token=tok)
+        check("退货剩余全部确认成功",
+              s == 200 and d.get("status") == "done", f"status={s} {d}")
+        check("退货单确认完进已结单/出货单",
+              _in_view(ret_r, "returns", "closed", "outbound")
+              and not _in_view(ret_r, "returns", "open"), f"status={s} {d}")
+        check("正常退货副仓共 +4 瓶", _stock(wh_ret, wid_r) == 4,
+              f"stock={_stock(wh_ret, wid_r)}")
+        s, d = req("POST", "/api/returns",
+                   {"kind": "sale", "orig_order_id": out_r,
+                    "warehouse_id": wh_ret, "reason": "退回来摔坏了",
+                    "items": [{"orig_item_id": item_r, "qty": 2,
+                               "disposition": "damage"}]}, token=tok)
+        ret_r2 = d.get("id")
+        check("建破损退货单 2 瓶", s == 200 and ret_r2, f"status={s} {d}")
+        s, d = req("POST", f"/api/returns/{ret_r2}/confirm", {}, token=tok)
+        check("破损退货确认成功", s == 200, f"status={s} {d}")
+        check("破损退货不加库存 (副仓仍 4 瓶)",
+              _stock(wh_ret, wid_r) == 4, f"stock={_stock(wh_ret, wid_r)}")
+        cd2, _ = _debt()
+        check("破损退货确认后客户欠款再减 800",
+              abs(cd2 - (cd1 - 800)) < 0.01, f"d1={cd1} d2={cd2}")
+        # 退货单废单释放占用: 可退 = 10 - 已退 6 = 4
+        s, d = req("POST", "/api/returns",
+                   {"kind": "sale", "orig_order_id": out_r,
+                    "warehouse_id": wh_ret, "reason": "占位",
+                    "items": [{"orig_item_id": item_r, "qty": 4,
+                               "disposition": "normal"}]}, token=tok)
+        ret_r3 = d.get("id")
+        check("建退货单占满剩余可退量", s == 200 and ret_r3, f"status={s} {d}")
+        s, d = req("POST", "/api/returns",
+                   {"kind": "sale", "orig_order_id": out_r,
+                    "warehouse_id": wh_ret, "reason": "超占",
+                    "items": [{"orig_item_id": item_r, "qty": 1,
+                               "disposition": "normal"}]}, token=tok)
+        check("待确认退货单占用额度, 再退被拒 400", s == 400,
+              f"status={s} {d}")
+        s, d = req("POST", f"/api/orders/returns/{ret_r3}/void", {}, token=tok)
+        check("未确认退货单整单废成功",
+              s == 200 and d.get("status") == "voided", f"status={s} {d}")
+        s, d = req("POST", "/api/returns",
+                   {"kind": "sale", "orig_order_id": out_r,
+                    "warehouse_id": wh_ret, "reason": "释放后重退",
+                    "items": [{"orig_item_id": item_r, "qty": 2,
+                               "disposition": "normal"}]}, token=tok)
+        ret_r4 = d.get("id")
+        check("废单释放占用后可重新退货", s == 200 and ret_r4, f"status={s} {d}")
+        s, d = req("GET", f"/api/returns/{ret_r4}", token=tok)
+        ritem_r4 = d["items"][0]["id"]
+        s, d = req("POST", f"/api/returns/{ret_r4}/confirm",
+                   {"items": [{"item_id": ritem_r4, "qty": 1}]}, token=tok)
+        check("退货单部分确认成功", s == 200, f"status={s} {d}")
+        s, d = req("POST", f"/api/orders/returns/{ret_r4}/void", {}, token=tok)
+        check("退货单部分确认后废剩余变已关闭",
+              s == 200 and d.get("status") == "closed", f"status={s} {d}")
+        s, d = req("POST", "/api/returns",
+                   {"kind": "sale", "orig_order_id": out_r,
+                    "warehouse_id": wh_ret, "reason": "超量",
+                    "items": [{"orig_item_id": item_r, "qty": 4,
+                               "disposition": "normal"}]}, token=tok)
+        check("已关闭退货单只按已确认计已退, 余量 3 瓶退 4 被拒",
+              s == 400, f"status={s} {d}")
+        s, d = req("POST", "/api/returns",
+                   {"kind": "sale", "orig_order_id": out_r,
+                    "warehouse_id": wh_ret, "reason": "退完",
+                    "items": [{"orig_item_id": item_r, "qty": 3,
+                               "disposition": "normal"}]}, token=tok)
+        ret_r5 = d.get("id")
+        check("建最后 3 瓶退货单", s == 200 and ret_r5, f"status={s} {d}")
+        s, d = req("POST", f"/api/returns/{ret_r5}/confirm", {}, token=tok)
+        check("最后退货确认成功", s == 200, f"status={s} {d}")
+        check("退货确认完的单不能再废", req(
+            "POST", f"/api/orders/returns/{ret_r5}/void", {}, token=tok)[0] == 400,
+            f"status={s} {d}")
+
+        # 27b. 采购退货全流程
+        s, w = req("POST", "/api/wines",
+                   {"barcode": "6901234567899", "name": "采购退货酒",
+                    "capacity_ml": 500, "sale_price": 100}, token=tok)
+        wid_p = w.get("id")
+        check("建采购退货酒", s == 200 and wid_p, f"status={s} {w}")
+        s, d = req("POST", "/api/inbound",
+                   {"type": "opening", "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_p, "qty": 10, "unit_price": 50}]},
+                   token=tok)
+        s, d = req("POST", "/api/inbound",
+                   {"type": "purchase", "supplier_id": sup, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_p, "qty": 5, "unit_price": 60}]},
+                   token=tok)
+        in_p = d.get("id")
+        check("建进货单 5 瓶", s == 200 and in_p, f"status={s} {d}")
+        s, d = req("POST", f"/api/inbound/{in_p}/confirm", {}, token=tok)
+        check("进货单确认成功", s == 200, f"status={s} {d}")
+        check("进货确认后主仓 15 瓶", _stock(wh1, wid_p) == 15,
+              f"stock={_stock(wh1, wid_p)}")
+        _, sd0 = _debt()
+        s, d = req("GET", f"/api/inbound/{in_p}", token=tok)
+        item_p = d["items"][0]["id"]
+        s, d = req("POST", "/api/returns",
+                   {"kind": "purchase", "orig_order_id": in_p,
+                    "reason": "质量问题",
+                    "items": [{"orig_item_id": item_p, "qty": 3}]}, token=tok)
+        ret_p = d.get("id")
+        check("建采购退货单 3 瓶", s == 200 and ret_p, f"status={s} {d}")
+        check("采购退货单在未结单/进货单",
+              _in_view(ret_p, "returns", "open")
+              and not _in_view(ret_p, "returns", "closed"), f"status={s} {d}")
+        s, d = req("POST", f"/api/returns/{ret_p}/confirm", {}, token=tok)
+        check("采购退货确认成功", s == 200, f"status={s} {d}")
+        check("采购退货确认后主仓 12 瓶", _stock(wh1, wid_p) == 12,
+              f"stock={_stock(wh1, wid_p)}")
+        _, sd1 = _debt()
+        check("采购退货确认后供应商欠款减少 180", sd1 == sd0 - 180,
+              f"d0={sd0} d1={sd1}")
+        s, d = req("POST", "/api/returns",
+                   {"kind": "purchase", "orig_order_id": in_p,
+                    "reason": "超量",
+                    "items": [{"orig_item_id": item_p, "qty": 3}]}, token=tok)
+        check("采购超量退货被拒 400", s == 400, f"status={s} {d}")
+        # 采购退货确认时库存不足被拒: 先把 12 瓶全卖掉
+        s, d = req("POST", "/api/outbound",
+                   {"customer_id": cus, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_p, "qty": 12, "unit_price": 100}]},
+                   token=tok)
+        out_p = d.get("id")
+        s, d = req("POST", f"/api/outbound/{out_p}/confirm", {}, token=tok)
+        check("卖掉 12 瓶后主仓 0 瓶", _stock(wh1, wid_p) == 0,
+              f"stock={_stock(wh1, wid_p)}")
+        s, d = req("POST", "/api/returns",
+                   {"kind": "purchase", "orig_order_id": in_p,
+                    "reason": "再退",
+                    "items": [{"orig_item_id": item_p, "qty": 2}]}, token=tok)
+        ret_p2 = d.get("id")
+        check("建采购退货单 2 瓶", s == 200 and ret_p2, f"status={s} {d}")
+        s, d = req("POST", f"/api/returns/{ret_p2}/confirm", {}, token=tok)
+        check("采购退货确认时库存不足被拒 400 且报错含缺货信息",
+              s == 400 and "缺" in str(d) and "主仓" in str(d),
+              f"status={s} {d}")
+
+        # 27c. 付款撤销
+        s, d = req("POST", "/api/outbound",
+                   {"customer_id": cus, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_r, "qty": 2, "unit_price": 200}]},
+                   token=tok)
+        out_c = d.get("id")
+        s, d = req("POST", f"/api/outbound/{out_c}/confirm", {}, token=tok)
+        check("撤销测试销售单确认成功", s == 200, f"status={s} {d}")
+        cd0, _ = _debt()
+        s, d = req("POST", f"/api/orders/outbound/{out_c}/payments",
+                   {"amount": 150}, token=tok)
+        check("补记收款 150", s == 200, f"status={s} {d}")
+        cd1, _ = _debt()
+        check("收款后客户欠款减少 150", abs(cd1 - (cd0 - 150)) < 0.01,
+              f"d0={cd0} d1={cd1}")
+        s, d = req("GET", f"/api/outbound/{out_c}", token=tok)
+        pay_c = [p for p in d.get("payments") or [] if not p.get("voided")]
+        check("单据详情带付款记录", len(pay_c) == 1, f"status={s} {d}")
+        pid_c = pay_c[0]["id"]
+        s, d = req("POST",
+                   f"/api/orders/outbound/{out_c}/payments/{pid_c}/void",
+                   {"reason": "记错了"}, token=tok)
+        check("撤销收款成功", s == 200, f"status={s} {d}")
+        cd2, _ = _debt()
+        check("撤销后客户欠款恢复", cd2 == cd0, f"d0={cd0} d2={cd2}")
+        s, d = req("POST",
+                   f"/api/orders/outbound/{out_c}/payments/{pid_c}/void",
+                   {"reason": "再撤"}, token=tok)
+        check("重复撤销被拒 400", s == 400, f"status={s} {d}")
+        s, d = req("POST", f"/api/orders/outbound/{out_c}/payments",
+                   {"amount": 50}, token=tok)
+        s, d = req("GET", f"/api/outbound/{out_c}", token=tok)
+        pid_c2 = [p for p in d.get("payments") or [] if not p.get("voided")][0]["id"]
+        s, d = req("POST",
+                   f"/api/orders/outbound/{out_c}/payments/{pid_c2}/void",
+                   {}, token=tok)
+        check("撤销理由必填 (无理由被拒 400)", s == 400, f"status={s} {d}")
+        s, d = req("POST",
+                   f"/api/orders/outbound/{out_c}/payments/{pid_c2}/void",
+                   {"reason": "多记了"}, token=tok)
+        check("有理由撤销成功", s == 200, f"status={s} {d}")
+        s, logs = req("GET", "/api/audit-logs", token=tok)
+        acts = {l["action"] for l in logs} if isinstance(logs, list) else set()
+        check("审计记录有撤销收款",
+              "撤销收款" in acts, f"actions={sorted(acts)}")
+        # 进货付款撤销
+        s, d = req("POST", "/api/inbound",
+                   {"type": "purchase", "supplier_id": sup, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_r, "qty": 1, "unit_price": 100}]},
+                   token=tok)
+        in_c = d.get("id")
+        s, d = req("POST", f"/api/inbound/{in_c}/confirm", {}, token=tok)
+        s, d = req("POST", f"/api/orders/inbound/{in_c}/payments",
+                   {"amount": 100}, token=tok)
+        s, d = req("GET", f"/api/inbound/{in_c}", token=tok)
+        pid_in = [p for p in d.get("payments") or [] if not p.get("voided")][0]["id"]
+        _, sd0 = _debt()
+        s, d = req("POST",
+                   f"/api/orders/inbound/{in_c}/payments/{pid_in}/void",
+                   {"reason": "付错了"}, token=tok)
+        check("撤销进货付款成功", s == 200, f"status={s} {d}")
+        _, sd1 = _debt()
+        check("撤销后供应商欠款恢复 (+100)", sd1 == sd0 + 100,
+              f"d0={sd0} d1={sd1}")
+
+        # 27d. 防超卖
+        s, w = req("POST", "/api/wines",
+                   {"barcode": "6901234567900", "name": "防超卖酒",
+                    "capacity_ml": 750, "sale_price": 200}, token=tok)
+        wid_s = w.get("id")
+        check("建防超卖酒", s == 200 and wid_s, f"status={s} {w}")
+        s, d = req("POST", "/api/inbound",
+                   {"type": "opening", "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_s, "qty": 5, "unit_price": 100}]},
+                   token=tok)
+        s, d = req("POST", "/api/outbound",
+                   {"customer_id": cus, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_s, "qty": 5, "unit_price": 200}]},
+                   token=tok)
+        out_s1 = d.get("id")
+        s, d = req("POST", "/api/outbound",
+                   {"customer_id": cus, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_s, "qty": 5, "unit_price": 200}]},
+                   token=tok)
+        out_s2 = d.get("id")
+        check("两张 5 瓶出货单建单都成功 (下单不扣库存)",
+              s == 200 and out_s1 and out_s2, f"status={s} {d}")
+        s, d = req("POST", f"/api/outbound/{out_s1}/confirm", {}, token=tok)
+        check("第一张确认成功", s == 200, f"status={s} {d}")
+        check("确认后主仓 0 瓶", _stock(wh1, wid_s) == 0,
+              f"stock={_stock(wh1, wid_s)}")
+        s, d = req("POST", f"/api/outbound/{out_s2}/confirm", {}, token=tok)
+        check("第二张确认被拒 400 且报错含仓库/酒名/缺多少瓶",
+              s == 400 and "缺" in str(d) and "主仓" in str(d)
+              and "防超卖酒" in str(d), f"status={s} {d}")
+        s, d = req("POST", "/api/inbound",
+                   {"type": "opening", "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_s, "qty": 2, "unit_price": 100}]},
+                   token=tok)
+        s, d = req("POST", f"/api/outbound/{out_s2}/confirm",
+                   {"items": []}, token=tok)
+        check("空确认请求被拒 400", s == 400, f"status={s} {d}")
+        s, dd = req("GET", f"/api/outbound/{out_s2}", token=tok)
+        item_s2 = dd["items"][0]["id"]
+        s, d = req("POST", f"/api/outbound/{out_s2}/confirm",
+                   {"items": [{"item_id": item_s2, "qty": 2}]}, token=tok)
+        check("部分确认到可用量内成功 (2 瓶)",
+              s == 200 and d.get("status") == "partial", f"status={s} {d}")
+        check("部分确认后主仓 0 瓶", _stock(wh1, wid_s) == 0,
+              f"stock={_stock(wh1, wid_s)}")
+        # 建单时同酒多行汇总校验
+        s, d = req("POST", "/api/inbound",
+                   {"type": "opening", "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_s, "qty": 3, "unit_price": 100}]},
+                   token=tok)
+        s, d = req("POST", "/api/outbound",
+                   {"customer_id": cus, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_s, "qty": 2, "unit_price": 200},
+                              {"wine_id": wid_s, "qty": 2, "unit_price": 200}]},
+                   token=tok)
+        check("同酒多行合计超库存建单被拒 400 且报错汇总",
+              s == 400 and "缺" in str(d), f"status={s} {d}")
+        # 调拨确认超卖
+        s, d = req("POST", "/api/transfers",
+                   {"wine_id": wid_s, "from_warehouse_id": wh1,
+                    "to_warehouse_id": wh_ret, "qty": 3}, token=tok)
+        s, ds = req("GET", "/api/transfers", token=tok)
+        tr_s = [x for x in ds if x["transfer_no"] == d.get("transfer_no")][0]["id"]
+        s, d = req("POST", "/api/outbound",
+                   {"customer_id": cus, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_s, "qty": 3, "unit_price": 200}]},
+                   token=tok)
+        out_s3 = d.get("id")
+        s, d = req("POST", f"/api/outbound/{out_s3}/confirm", {}, token=tok)
+        check("卖掉 3 瓶后主仓 0 瓶", _stock(wh1, wid_s) == 0,
+              f"stock={_stock(wh1, wid_s)}")
+        s, d = req("POST", f"/api/transfers/{tr_s}/confirm", {}, token=tok)
+        check("调拨确认时库存不足被拒 400 且报错含缺货信息",
+              s == 400 and "缺" in str(d) and "主仓" in str(d),
+              f"status={s} {d}")
+        # 立即生效的自饮建单时也要校验库存
+        s, d = req("POST", "/api/outbound",
+                   {"type": "personal", "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_s, "qty": 1}]}, token=tok)
+        check("自饮建单时库存不足被拒 400", s == 400 and "缺" in str(d),
+              f"status={s} {d}")
+
+        # 27e. 备份与恢复 (对正在跑的测试库做在线备份再恢复, 行数对照)
+        import sqlite3 as _sqlite3
+        bdir = os.path.join(tmp, "backups")
+        env_b = dict(os.environ, VIN_ROUGE_DB=os.path.join(tmp, "test.db"),
+                     VIN_ROUGE_BACKUP_DIR=bdir, PATH=os.environ["PATH"])
+        r = subprocess.run(["/bin/sh", str(BASE / "scripts" / "backup.sh")],
+                           capture_output=True, text=True, env=env_b)
+        check("backup.sh 跑成功", r.returncode == 0,
+              f"rc={r.returncode} out={r.stdout.strip()} err={r.stderr.strip()}")
+        daily = sorted(Path(bdir, "daily").glob("vin_rouge-*.db")) \
+            if Path(bdir, "daily").exists() else []
+        check("备份文件已生成", len(daily) == 1, f"files={daily}")
+        bak = str(daily[0]) if daily else ""
+        rdir = os.path.join(tmp, "restored")
+        r = subprocess.run(["/bin/sh", str(BASE / "scripts" / "restore.sh"),
+                            bak, rdir], capture_output=True, text=True)
+        check("restore.sh 跑成功", r.returncode == 0 and "恢复完成" in r.stdout,
+              f"rc={r.returncode} out={r.stdout.strip()} err={r.stderr.strip()}")
+        tables = ["users", "wines", "stock", "inbound_orders",
+                  "outbound_orders", "return_orders", "payments"]
+        _okc = True
+        for _t in tables:
+            _a = _sqlite3.connect(os.path.join(tmp, "test.db")).execute(
+                f"SELECT COUNT(*) FROM {_t}").fetchone()[0]
+            _b = _sqlite3.connect(os.path.join(rdir, "vin_rouge.db")).execute(
+                f"SELECT COUNT(*) FROM {_t}").fetchone()[0]
+            if _a != _b:
+                _okc = False
+        check("恢复后的库行数与原库一致", _okc, f"tables={tables}")
+
+        # 27f. 前端: 退货页/退货卡片/付款撤销/多付显示在场
+        s, html = req("GET", "/")
+        check("退货单页面与表单在场",
+              'id="page-returns"' in html and 'id="ret-reason"' in html
+              and 'id="ret-wh"' in html and 'id="ret-lines"' in html,
+              f"status={s}")
+        check("退货卡片与入口在场 (returnCard/openReturn/退货按钮)",
+              "returnCard" in html and "openReturn" in html
+              and "退货" in html, f"status={s}")
+        check("付款撤销入口在场 (voidPayment)",
+              "voidPayment" in html and "撤销" in html, f"status={s}")
+        check("欠款为负显示多付", "多付 ¥" in html, f"status={s}")
+        check("原单行显示已退数量", "已退" in html, f"status={s}")
+        check("前端欠款口径含退货冲减 (returned_amount/ordOwed)",
+              "ordOwed" in html and "returned_amount" in html, f"status={s}")
 
         # 14. audit_logs 有记录
         s, logs = req("GET", "/api/audit-logs", token=tok)

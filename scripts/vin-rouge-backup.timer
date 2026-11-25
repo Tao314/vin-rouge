@@ -1,0 +1,10 @@
+[Unit]
+Description=每天备份 vin-rouge 数据库
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+Unit=vin-rouge-backup.service
+
+[Install]
+WantedBy=timers.target
