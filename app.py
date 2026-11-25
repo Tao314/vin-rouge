@@ -26,7 +26,7 @@ TOKEN_TTL_HOURS = 24
 # ---------- 版本（单点管理） ----------
 # 唯一版本源：只改 APP_VERSION，全仓同步
 # （前端页脚、README、/api/version、/api/config 都以它为准，不要在别处手写版本号）。
-APP_VERSION = "v2.0.2"
+APP_VERSION = "v2.1.0"
 BUILD_DATE = "2026-11-25"
 
 
@@ -121,12 +121,9 @@ def init_db():
             _cols = [r[1] for r in c.execute(f"PRAGMA table_info({_t})")]
             if _col not in _cols:
                 c.execute(f"ALTER TABLE {_t} ADD COLUMN {_col} {_ddl}")
-        n = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-        if n == 0:
-            c.execute("INSERT INTO users(username,display_name,password_hash,"
-                      "must_change_password,created_at) VALUES(?,?,?,?,?)",
-                      ("tristan", "Tristan", hash_pw("vin123456"), 1,
-                       datetime.now().isoformat()))
+        # 无默认用户: 首位管理员由首次注册产生, 注册后即关闭.
+        # 示例数据只在仓库表为空时插一次, 与用户数无关, 避免重复插.
+        if c.execute("SELECT COUNT(*) FROM warehouses").fetchone()[0] == 0:
             c.execute("INSERT INTO warehouses(name) VALUES('主仓'),('副仓')")
             c.execute("INSERT INTO suppliers(name,contact,phone,note) VALUES"
                       "('示例供应商','张经理','13800000000','示例数据')")
@@ -222,6 +219,41 @@ def version_info():
 def config_info():
     return {"version": APP_VERSION, "build_date": BUILD_DATE,
             "commit": _git_commit(), "port": int(os.environ.get("PORT", "9000"))}
+
+
+@app.get("/api/auth/status")
+def auth_status():
+    with conn() as c:
+        n = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    return {"has_users": n > 0, "registration_open": n == 0}
+
+
+@app.post("/api/register")
+async def register_first_admin(request: Request):
+    b = await request.json()
+    username = (b.get("username") or "").strip()
+    password = b.get("password") or ""
+    if not username:
+        return err("用户名必填")
+    if len(password) < 6:
+        return err("密码至少 6 位")
+    with conn() as c:
+        if c.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0:
+            return JSONResponse({"detail": "注册已关闭，首位管理员已注册"},
+                                status_code=403)
+        if c.execute("SELECT 1 FROM users WHERE username=?",
+                     (username,)).fetchone():
+            return err("用户名已存在")
+        token = secrets.token_hex(32)
+        exp = (datetime.now() + timedelta(hours=TOKEN_TTL_HOURS)).isoformat()
+        c.execute("INSERT INTO users(username,display_name,password_hash,"
+                  "must_change_password,session_token,session_expires_at,"
+                  "created_at) VALUES(?,?,?,?,?,?,?)",
+                  (username, username, hash_pw(password), 0, token, exp,
+                   datetime.now().isoformat()))
+        audit(c, username, "注册首位管理员", username, "首位管理员注册，注册已关闭")
+        return {"token": token, "username": username,
+                "display_name": username, "must_change_password": False}
 
 
 # ---------- 登录 / 用户 ----------

@@ -36,8 +36,14 @@ td,th{border-bottom:1px solid #eee;padding:8px 4px;text-align:left}
 <label>用户名</label><input id="login-user" placeholder="用户名">
 <label>密码</label><input id="login-pw" type="password" placeholder="密码">
 <button onclick="doLogin()">登录</button>
-<p class="muted">首次部署默认管理员 tristan / vin123456，登录后须立即改密码。</p>
+<p class="muted">首次使用请先注册首位管理员，注册后即关闭注册。</p>
 <p class="muted">当前版本 <span id="login-ver">…</span></p></div>
+<!-- 首次注册首位管理员（仅无用户时显示） -->
+<div id="page-register" class="card hidden"><h2>注册首位管理员</h2>
+<label>用户名</label><input id="reg-user" placeholder="用户名">
+<label>密码（至少6位）</label><input id="reg-pw" type="password" placeholder="密码">
+<button onclick="doRegister()">注册并进入</button>
+<p class="muted">第一个注册的为管理员，注册后关闭注册，后续管理员由该管理员在“用户管理”里生成。</p></div>
 <!-- 改密 -->
 <div id="page-chpw" class="card hidden"><h2>首次登录，请修改密码</h2>
 <label>原密码</label><input id="old-pw" type="password">
@@ -159,6 +165,8 @@ let me=localStorage.getItem('vr_user')||'';
 function headers(){return {'Content-Type':'application/json','Authorization':'Bearer '+token}}
 async function api(path,method='GET',body){const r=await fetch(path,{method,headers:headers(),body:body?JSON.stringify(body):undefined});if(r.status===401){logout();throw new Error('未登录')}const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.detail||('请求失败 '+r.status));return d}
 function show(p){['home','wines','suppliers','customers','inbound','opening','outbound','transfer','orders','users','audit'].forEach(x=>$('page-'+x).classList.toggle('hidden',x!==p));if(p==='home')loadHome();if(p==='wines')loadWines();if(p==='suppliers')loadParties('suppliers');if(p==='customers')loadParties('customers');if(p==='users')loadUsers();if(p==='audit')loadAudit();if(['inbound','opening','outbound','transfer'].includes(p))loadFormOptions();}
+async function doRegister(){try{const r=await fetch('/api/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('reg-user').value,password:$('reg-pw').value})});const d=await r.json();if(!r.ok)throw new Error(d.detail);token=d.token;me=d.username;localStorage.setItem('vr_token',token);localStorage.setItem('vr_user',me);enterApp();}catch(e){alert(e.message)}}
+async function loadAuthStatus(){try{const r=await fetch('/api/auth/status');const d=await r.json();if(d.registration_open){$('page-login').classList.add('hidden');$('page-register').classList.remove('hidden');}}catch(e){}}
 async function doLogin(){try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('login-user').value,password:$('login-pw').value})});const d=await r.json();if(!r.ok)throw new Error(d.detail);token=d.token;me=d.username;localStorage.setItem('vr_token',token);localStorage.setItem('vr_user',me);if(d.must_change_password){$('page-login').classList.add('hidden');$('page-chpw').classList.remove('hidden');}else enterApp();}catch(e){alert(e.message)}}
 async function doChangePw(){try{await fetch('/api/change-password',{method:'POST',headers:headers(),body:JSON.stringify({old_password:$('old-pw').value,new_password:$('new-pw').value})}).then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.detail)});$('page-chpw').classList.add('hidden');enterApp();}catch(e){alert(e.message)}}
 function enterApp(){$('page-login').classList.add('hidden');$('page-chpw').classList.add('hidden');$('app').classList.remove('hidden');$('logoutBtn').classList.remove('hidden');$('who').textContent=me;show('home');}
@@ -185,5 +193,5 @@ async function saveUser(){await api('/api/users','POST',{username:$('u-name').va
 async function loadAudit(){const ls=await api('/api/audit-logs');$('audit-list').innerHTML=ls.map(l=>`<div>${l.created_at} <b>${l.username}</b> ${l.action} ${l.target||''} <span class="muted">${l.note||''}</span></div>`).join('')||'暂无记录';}
 async function loadVersion(){try{const r=await fetch('/api/version');const d=await r.json();if(d.version){$('ver').textContent=d.version;const lv=$('login-ver');if(lv)lv.textContent=d.version;}}catch(e){}}
 loadVersion();
-if(token){$('page-login').classList.add('hidden');enterApp();}else{$('page-login').classList.remove('hidden');}
+if(token){$('page-login').classList.add('hidden');$('page-register').classList.add('hidden');enterApp();}else{$('page-login').classList.remove('hidden');loadAuthStatus();}
 </script></body></html>
