@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import re
 import secrets
 import subprocess
 import sqlite3
@@ -26,7 +27,7 @@ TOKEN_TTL_HOURS = 24
 # ---------- 版本（单点管理） ----------
 # 唯一版本源：只改 APP_VERSION，全仓同步
 # （前端页脚、README、/api/version、/api/config 都以它为准，不要在别处手写版本号）。
-APP_VERSION = "v2.7.0"
+APP_VERSION = "v2.8.0"
 BUILD_DATE = "2026-11-25"
 
 
@@ -62,10 +63,13 @@ def init_db():
           target TEXT, note TEXT, created_at TEXT);
         CREATE TABLE IF NOT EXISTS wines(
           id INTEGER PRIMARY KEY AUTOINCREMENT, barcode TEXT UNIQUE, name TEXT NOT NULL,
-          brand TEXT, spec TEXT, capacity_ml INTEGER, abv REAL, origin TEXT,
+          spec TEXT, capacity_ml INTEGER, abv REAL, origin TEXT,
           manufacturer TEXT, image_path TEXT, description TEXT,
           sale_price REAL,
           created_at TEXT, updated_at TEXT);
+        CREATE TABLE IF NOT EXISTS wine_price_history(
+          id INTEGER PRIMARY KEY AUTOINCREMENT, wine_id INTEGER NOT NULL,
+          old_price REAL, new_price REAL, changed_by TEXT, changed_at TEXT);
         CREATE TABLE IF NOT EXISTS warehouses(
           id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, active INTEGER DEFAULT 1);
         CREATE TABLE IF NOT EXISTS suppliers(
@@ -141,15 +145,33 @@ def init_db():
                 ("outbound_items", "cost_price", "REAL DEFAULT 0"),
                 ("outbound_items", "reason", "TEXT"),
                 ("wines", "sale_price", "REAL"),
+                ("wines", "updated_at", "TEXT"),
+                ("wines", "capacity_ml", "INTEGER"),
                 ("inbound_orders", "status", "TEXT DEFAULT 'pending'"),
                 ("inbound_items", "confirmed_qty", "INTEGER DEFAULT 0"),
                 ("outbound_orders", "status", "TEXT DEFAULT 'pending'"),
                 ("outbound_items", "confirmed_qty", "INTEGER DEFAULT 0"),
                 ("outbound_orders", "freight_rule", "INTEGER DEFAULT 0"),
+                ("inbound_items", "wine_name", "TEXT"),
+                ("inbound_items", "wine_spec", "TEXT"),
+                ("outbound_items", "wine_name", "TEXT"),
+                ("outbound_items", "wine_spec", "TEXT"),
                 ("transfers", "status", "TEXT DEFAULT 'pending'")):
             _cols = [r[1] for r in c.execute(f"PRAGMA table_info({_t})")]
             if _col not in _cols:
                 c.execute(f"ALTER TABLE {_t} ADD COLUMN {_col} {_ddl}")
+        # v2.8.0: 规格统一为单瓶容量数字(ml), 品牌列删除. 系统未正式启用,
+        # 库里只有演示数据, 直接按新规则迁移, 不留老数据兼容逻辑.
+        _wcols = [r[1] for r in c.execute("PRAGMA table_info(wines)")]
+        if "brand" in _wcols:
+            c.execute("ALTER TABLE wines DROP COLUMN brand")
+        for _r in c.execute("SELECT id, spec, capacity_ml FROM wines").fetchall():
+            _cap = _r["capacity_ml"]
+            if _cap is None:
+                _m = re.match(r"\s*(\d+)", _r["spec"] or "")
+                _cap = int(_m.group(1)) if _m else None
+            c.execute("UPDATE wines SET capacity_ml=?, spec=? WHERE id=?",
+                      (_cap, str(_cap) if _cap is not None else "", _r["id"]))
         # 无默认用户: 首位管理员由首次注册产生, 注册后即关闭.
         # 示例数据只在仓库表为空时插一次, 与用户数无关, 避免重复插.
         if c.execute("SELECT COUNT(*) FROM warehouses").fetchone()[0] == 0:
@@ -159,13 +181,13 @@ def init_db():
             c.execute("INSERT INTO customers(name,phone,note) VALUES"
                       "('示例客户','13900000000','示例数据')")
             now = datetime.now().isoformat()
-            c.execute("INSERT INTO wines(barcode,name,brand,spec,origin,description,"
+            c.execute("INSERT INTO wines(barcode,name,spec,capacity_ml,origin,description,"
                       "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                      ("6900000000001", "示例红酒 A", "示例品牌", "750ml*6瓶/箱",
+                      ("6900000000001", "示例红酒 A", "750", 750,
                        "法国", "示例酒，仅用于演示", now, now))
-            c.execute("INSERT INTO wines(barcode,name,brand,spec,origin,description,"
+            c.execute("INSERT INTO wines(barcode,name,spec,capacity_ml,origin,description,"
                       "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                      ("6900000000002", "示例白酒 B", "示例品牌", "500ml*6瓶/箱",
+                      ("6900000000002", "示例白酒 B", "500", 500,
                        "中国", "示例酒，仅用于演示", now, now))
 
 
@@ -196,6 +218,33 @@ def rowdict(r):
 
 def rows(c, sql, args=()):
     return [dict(r) for r in c.execute(sql, args)]
+
+
+def fmt_spec(capacity_ml, spec):
+    """规格统一显示: 单瓶容量数字 + ml (如 750ml)."""
+    if capacity_ml is not None:
+        try:
+            return f"{int(capacity_ml)}ml"
+        except (TypeError, ValueError):
+            pass
+    s = (spec or "").strip()
+    return s + "ml" if s.isdigit() else s
+
+
+def parse_capacity(v):
+    """规格只允许正整数 (ml); 空表示不填. 非法时抛 ValueError."""
+    if v in (None, ""):
+        return None
+    if isinstance(v, bool):
+        raise ValueError("单瓶容量须为正整数")
+    if isinstance(v, (int, float)):
+        if float(v) == int(v) and int(v) > 0:
+            return int(v)
+        raise ValueError("单瓶容量须为正整数")
+    s = str(v).strip()
+    if re.fullmatch(r"\d+", s) and int(s) > 0:
+        return int(s)
+    raise ValueError("单瓶容量须为正整数")
 
 
 # ---------- Auth ----------
@@ -416,17 +465,25 @@ async def create_wine(request: Request):
     b = await request.json()
     if not b.get("name"):
         return err("酒名必填")
+    # 规格统一为单瓶容量正整数(ml); 没填 capacity_ml 时从 spec 开头数字里提
+    try:
+        cap = parse_capacity(b.get("capacity_ml"))
+        if cap is None:
+            _m = re.match(r"\s*(\d+)", str(b.get("spec") or ""))
+            cap = int(_m.group(1)) if _m else None
+    except ValueError as ve:
+        return err(str(ve))
     now = datetime.now().isoformat()
     with conn() as c:
         try:
             sp = b.get("sale_price")
             sp = float(sp) if sp not in (None, "") else None
             cur = c.execute(
-                "INSERT INTO wines(barcode,name,brand,spec,capacity_ml,abv,origin,"
+                "INSERT INTO wines(barcode,name,spec,capacity_ml,abv,origin,"
                 "manufacturer,description,sale_price,created_at,updated_at)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-                (b.get("barcode") or None, b["name"], b.get("brand"),
-                 b.get("spec"), b.get("capacity_ml"), b.get("abv"),
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (b.get("barcode") or None, b["name"],
+                 str(cap) if cap is not None else "", cap, b.get("abv"),
                  b.get("origin"), b.get("manufacturer"),
                  b.get("description"), sp, now, now))
         except sqlite3.IntegrityError:
@@ -441,20 +498,63 @@ async def update_wine(wid: int, request: Request):
     if e:
         return e
     b = await request.json()
-    fields = ["barcode", "name", "brand", "spec", "capacity_ml", "abv", "origin",
+    fields = ["barcode", "name", "spec", "capacity_ml", "abv", "origin",
               "manufacturer", "description", "sale_price"]
+    now = datetime.now().isoformat()
     with conn() as c:
+        old = c.execute("SELECT sale_price FROM wines WHERE id=?",
+                        (wid,)).fetchone()
+        if old is None:
+            return err("酒不存在", 404)
+        # 规格统一为单瓶容量正整数(ml)
+        if "capacity_ml" in b or "spec" in b:
+            try:
+                cap = parse_capacity(b.get("capacity_ml"))
+                if cap is None and "spec" in b:
+                    _m = re.match(r"\s*(\d+)", str(b.get("spec") or ""))
+                    cap = int(_m.group(1)) if _m else None
+            except ValueError as ve:
+                return err(str(ve))
+            b["capacity_ml"] = cap
+            b["spec"] = str(cap) if cap is not None else ""
+        # 售价: 只有真的变了才记价格历史 (同事务, 记操作人); 初始录入不记,
+        # 只改名/图片/说明不改价的不记
+        new_sp = None
+        if "sale_price" in b:
+            sp = b["sale_price"]
+            try:
+                new_sp = float(sp) if sp not in (None, "") else None
+            except (TypeError, ValueError):
+                return err("售价须为数字")
+            b["sale_price"] = new_sp
         sets = ", ".join(f"{f}=?" for f in fields if f in b)
         if not sets:
             return err("无可更新字段")
         try:
             c.execute(f"UPDATE wines SET {sets}, updated_at=? WHERE id=?",
-                      [b[f] for f in fields if f in b] +
-                      [datetime.now().isoformat(), wid])
+                      [b[f] for f in fields if f in b] + [now, wid])
         except sqlite3.IntegrityError:
             return err("条码已存在")
+        if "sale_price" in b and old["sale_price"] != new_sp:
+            c.execute("INSERT INTO wine_price_history"
+                      "(wine_id,old_price,new_price,changed_by,changed_at)"
+                      " VALUES(?,?,?,?,?)",
+                      (wid, old["sale_price"], new_sp, u["username"], now))
         audit(c, u["username"], "修改酒", str(wid), "")
         return {"ok": True}
+
+
+@app.get("/api/wines/{wid}/price-history")
+async def wine_price_history(wid: int, request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        if not c.execute("SELECT 1 FROM wines WHERE id=?", (wid,)).fetchone():
+            return err("酒不存在", 404)
+        return rows(c, "SELECT old_price, new_price, changed_by, changed_at"
+                       " FROM wine_price_history WHERE wine_id=?"
+                       " ORDER BY id DESC", (wid,))
 
 
 @app.post("/api/wines/{wid}/image")
@@ -604,7 +704,7 @@ async def inventory(request: Request):
         out = []
         for w in rows(c, "SELECT * FROM warehouses ORDER BY id"):
             items = rows(c, "SELECT s.wine_id, w.name AS wine_name, w.spec,"
-                         " s.quantity AS qty FROM stock s"
+                         " w.capacity_ml, s.quantity AS qty FROM stock s"
                          " JOIN wines w ON w.id=s.wine_id"
                          " WHERE s.warehouse_id=? AND s.quantity>0"
                          " ORDER BY w.name", (w["id"],))
@@ -894,8 +994,13 @@ def order_detail(c, table, items_table, oid):
     if not o:
         return None
     d = dict(o)
-    d["items"] = rows(c, f"SELECT i.*, w.name AS wine_name, w.spec FROM {items_table} i"
+    d["items"] = rows(c, f"SELECT i.*, COALESCE(i.wine_name, w.name) AS _wine_name,"
+                         " COALESCE(i.wine_spec, w.spec) AS _wine_spec, w.capacity_ml"
+                         f" FROM {items_table} i"
                          " JOIN wines w ON w.id=i.wine_id WHERE i.order_id=?", (oid,))
+    for _it in d["items"]:
+        _it["wine_name"] = _it.pop("_wine_name")
+        _it["spec"] = _it.pop("_wine_spec")
     otype = "inbound" if table == "inbound_orders" else "outbound"
     d["paid_amount"] = paid_total(c, otype, oid)
     return d
@@ -944,7 +1049,7 @@ async def dashboard(request: Request):
             sup_debt += (confirmed_total(c, "inbound_orders", "inbound_items",
                                          o["id"])
                          - paid_total(c, "inbound", o["id"]))
-        low = rows(c, "SELECT w.id, w.name, w.spec, COALESCE(SUM(s.quantity),0) qty"
+        low = rows(c, "SELECT w.id, w.name, w.spec, w.capacity_ml, COALESCE(SUM(s.quantity),0) qty"
                       " FROM wines w LEFT JOIN stock s ON s.wine_id=w.id"
                       " GROUP BY w.id HAVING qty < ?", (LOW_STOCK_THRESHOLD,))
 
@@ -1011,11 +1116,15 @@ async def create_inbound(request: Request):
              datetime.now().isoformat(), status))
         oid = cur.lastrowid
         for i in items:
+            _w = c.execute("SELECT name, capacity_ml, spec FROM wines WHERE id=?",
+                           (i["wine_id"],)).fetchone()
+            _wn = _w["name"] if _w else ""
+            _ws = fmt_spec(_w["capacity_ml"], _w["spec"]) if _w else ""
             c.execute("INSERT INTO inbound_items(order_id,wine_id,batch,qty,unit_price,"
-                      "confirmed_qty) VALUES(?,?,?,?,?,?)",
+                      "confirmed_qty,wine_name,wine_spec) VALUES(?,?,?,?,?,?,?,?)",
                       (oid, i["wine_id"], i.get("batch") or "",
                        int(i["qty"]), float(i.get("unit_price") or 0),
-                       int(i["qty"]) if typ == "opening" else 0))
+                       int(i["qty"]) if typ == "opening" else 0, _wn, _ws))
             if typ == "opening":
                 add_stock(c, b["warehouse_id"], i["wine_id"], i.get("batch") or "",
                           int(i["qty"]))
@@ -1112,8 +1221,6 @@ async def create_outbound(request: Request):
             reason = (i.get("reason") or "").strip()
             if typ == "sale":
                 if rate is not None or dprice is not None:
-                    if not reason and not (b.get("note") or "").strip():
-                        return err("打折需填写瑕疵/打折原因")
                     if rate is not None:
                         rate = float(rate)
                         if not 0 < rate <= 1:
@@ -1166,13 +1273,18 @@ async def create_outbound(request: Request):
              b.get("note"), datetime.now().isoformat(), status))
         oid = cur.lastrowid
         for l in lines:
+            _w = c.execute("SELECT name, capacity_ml, spec FROM wines WHERE id=?",
+                           (l["wine_id"],)).fetchone()
+            _wn = _w["name"] if _w else ""
+            _ws = fmt_spec(_w["capacity_ml"], _w["spec"]) if _w else ""
             c.execute("INSERT INTO outbound_items(order_id,wine_id,batch,qty,unit_price,"
                       "orig_price,discount_rate,discount_amount,cost_price,reason,"
-                      "confirmed_qty) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                      "confirmed_qty,wine_name,wine_spec)"
+                      " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                       (oid, l["wine_id"], l["batch"], l["qty"], l["unit_price"],
                        l["orig_price"], l["discount_rate"], l["discount_amount"],
                        l["cost_price"], l["reason"],
-                       l["qty"] if typ != "sale" else 0))
+                       l["qty"] if typ != "sale" else 0, _wn, _ws))
             if typ != "sale":
                 add_stock(c, wh, l["wine_id"], l["batch"], -l["qty"])
         paid = float(b.get("paid_amount") or 0) if typ == "sale" else 0.0
@@ -1627,12 +1739,13 @@ async def share_png(otype: str, oid: int, request: Request):
             lines = [f"单号: {d['order_no']}", f"日期: {d['order_date']}",
                      f"客户: {cust['name'] if cust else ''}"]
             for it in d["items"]:
+                _sp = fmt_spec(it.get("capacity_ml"), it.get("spec"))
                 if (it.get("discount_amount") or 0) > 0:
-                    lines.append(f"{it['wine_name']} {it.get('spec') or ''} x{it['qty']} "
+                    lines.append(f"{it['wine_name']} {_sp} x{it['qty']} "
                                  f"原价{it['orig_price']:.2f} 折后{it['unit_price']:.2f} "
                                  f"折扣{it['discount_amount']:.2f} 小计{it['qty']*it['unit_price']:.2f}")
                 else:
-                    lines.append(f"{it['wine_name']} {it.get('spec') or ''} x{it['qty']} "
+                    lines.append(f"{it['wine_name']} {_sp} x{it['qty']} "
                                  f"单价{it['unit_price']:.2f} 小计{it['qty']*it['unit_price']:.2f}")
             # 分享图总金额 = 折后货款 + 客户付运费 (新规则单; 老单按原规则只含货款)
             total = d["sale_total"] + (0 if d.get("freight_free") or not d.get("freight_rule")
@@ -1641,10 +1754,6 @@ async def share_png(otype: str, oid: int, request: Request):
             if (d.get("discount_total") or 0) > 0:
                 lines.append(f"其中折扣: {d['discount_total']:.2f} 元"
                              f" (原价合计 {d.get('orig_total') or 0:.2f} 元)")
-                reasons = sorted({(it.get("reason") or "") for it in d["items"]
-                                  if it.get("reason")})
-                if reasons:
-                    lines.append("折扣原因: " + "、".join(reasons))
             lines += [f"物流: {d.get('carrier') or ''} {d.get('tracking_no') or ''} "
                       f"运费{d['freight']:.2f} 元",
                       f"已付: {d['paid_amount']:.2f} 元  还欠: {max(total-d['paid_amount'],0):.2f} 元"]
@@ -1661,7 +1770,8 @@ async def share_png(otype: str, oid: int, request: Request):
             lines = [f"单号: {d['order_no']}", f"日期: {d['order_date']}",
                      f"供应商: {sup['name'] if sup else ''}"]
             for it in d["items"]:
-                lines.append(f"{it['wine_name']} {it.get('spec') or ''} x{it['qty']} "
+                lines.append(f"{it['wine_name']} "
+                             f"{fmt_spec(it.get('capacity_ml'), it.get('spec'))} x{it['qty']} "
                              f"单价{it['unit_price']:.2f} 小计{it['qty']*it['unit_price']:.2f}")
             total = d["goods_total"]
             lines += [f"货款合计: {total:.2f} 元",

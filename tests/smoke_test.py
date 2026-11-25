@@ -10,6 +10,7 @@ import tempfile
 import time
 import urllib.request
 import urllib.error
+from datetime import date
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent.parent
@@ -75,9 +76,9 @@ def main():
 
         # 1b. 版本接口公开返回 v2.5.2（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
         s, d = req("GET", "/api/version")
-        check("版本接口 /api/version 返回 v2.7.0", s == 200 and d.get("version") == "v2.7.0", f"status={s} {d}")
+        check("版本接口 /api/version 返回 v2.8.0", s == 200 and d.get("version") == "v2.8.0", f"status={s} {d}")
         s, d = req("GET", "/api/config")
-        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.7.0" and "build_date" in d, f"status={s} {d}")
+        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.8.0" and "build_date" in d, f"status={s} {d}")
 
         # 2. 无默认用户: 首位注册前注册开放, 默认账号登录失败
         s, d = req("GET", "/api/auth/status")
@@ -361,7 +362,7 @@ def main():
         check("折扣后今日销售额 960/毛利按折后算 360",
               db.get("today_sales") == 960 and db.get("today_profit") == 360, str(db))
 
-        # 20. 分享图: 折扣销售单有图, 赠送单被拒; 打折无原因被拒
+        # 20. 分享图: 折扣销售单有图, 赠送单被拒; 打折无原因可提交
         s, raw = req("GET", f"/api/orders/outbound/{disc_id}/share.png", token=tok)
         ok = False
         try:
@@ -377,7 +378,13 @@ def main():
                    {"type": "sale", "customer_id": cus, "warehouse_id": wh1,
                     "items": [{"wine_id": wid, "qty": 1, "orig_price": 200,
                                "discount_rate": 0.9}]}, token=tok)
-        check("打折无原因被拒", s == 400, f"status={s} {d}")
+        disc_nr_id = d.get("id")
+        check("打折无原因可提交 (折后 180)", s == 200 and disc_nr_id
+              and d.get("sale_total") == 180.0 and d.get("discount_total") == 20.0,
+              f"status={s} {d}")
+        s, d = req("POST", f"/api/orders/outbound/{disc_nr_id}/void", {},
+                   token=tok)
+        check("无原因折扣单废单清理", s == 200, f"status={s} {d}")
 
         # 13b. 停用后下拉不再出现（前端下拉只取 active 的，后端停用后立即刷新）
         s, d = req("POST", "/api/customers",
@@ -916,7 +923,7 @@ def main():
         # 23a. 酒的默认售价: 建酒可填售价, 列表带回, 修改生效, 不填则为空
         s, w = req("POST", "/api/wines",
                    {"barcode": "6901234567893", "name": "测试售价酒",
-                    "brand": "测试牌", "spec": "750ml", "sale_price": 268}, token=tok)
+                    "capacity_ml": 750, "sale_price": 268}, token=tok)
         wid_sp = w.get("id")
         check("建酒可填默认售价 268", s == 200 and wid_sp, f"status={s} {w}")
         s, ws = req("GET", "/api/wines", token=tok)
@@ -929,7 +936,7 @@ def main():
               f"status={s} {row}")
         s, w = req("POST", "/api/wines",
                    {"barcode": "6901234567894", "name": "测试无售价酒",
-                    "brand": "测试牌", "spec": "750ml"}, token=tok)
+                    "capacity_ml": 500}, token=tok)
         wid_nosp = w.get("id")
         s, ws = req("GET", "/api/wines", token=tok)
         row = [x for x in ws if x["id"] == wid_nosp][0]
@@ -946,9 +953,9 @@ def main():
         s, d = req("POST", "/api/outbound",
                    {"type": "sale", "customer_id": cus, "warehouse_id": wh1,
                     "items": [{"wine_id": wid_sp, "qty": 2, "orig_price": 288,
-                               "discount_rate": 0.9, "reason": "瓶身划痕"},
+                               "discount_rate": 0.9},
                               {"wine_id": wid_nosp, "qty": 3, "orig_price": 100,
-                               "discount_price": 80, "reason": "临期处理"},
+                               "discount_rate": 0.8},
                               {"wine_id": wid, "qty": 1, "orig_price": 150}]},
                    token=tok)
         disc3_id = d.get("id")
@@ -958,17 +965,21 @@ def main():
               f"status={s} {d}")
         s, d = req("GET", f"/api/outbound/{disc3_id}", token=tok)
         its = {i["wine_id"]: i for i in d["items"]}
-        check("每行折扣额和原因都按行存",
+        check("每行折扣额按行存 (无原因也能打折)",
               its[wid_sp]["discount_amount"] == 57.6
-              and its[wid_sp]["reason"] == "瓶身划痕"
               and its[wid_nosp]["discount_amount"] == 60
-              and its[wid_nosp]["reason"] == "临期处理"
               and its[wid]["discount_amount"] == 0, f"status={s} {d}")
         s, d = req("POST", "/api/outbound",
                    {"type": "sale", "customer_id": cus, "warehouse_id": wh1,
                     "items": [{"wine_id": wid_sp, "qty": 1, "orig_price": 288,
-                               "discount_price": 200}]}, token=tok)
-        check("折后价打折无原因被拒", s == 400, f"status={s} {d}")
+                               "discount_rate": 0.9}]}, token=tok)
+        disc_noreason_id = d.get("id")
+        check("打折无原因可提交 (折后价 259.2 按折扣率算)",
+              s == 200 and disc_noreason_id and d.get("sale_total") == 259.2
+              and d.get("discount_total") == 28.8, f"status={s} {d}")
+        s, d = req("POST", f"/api/orders/outbound/{disc_noreason_id}/void", {},
+                   token=tok)
+        check("无原因折扣单废单清理", s == 200, f"status={s} {d}")
         s, d = req("POST", f"/api/outbound/{disc3_id}/confirm", {}, token=tok)
         check("确认三行折扣单后已出货",
               s == 200 and d.get("status") == "shipped", f"status={s} {d}")
@@ -1018,8 +1029,8 @@ def main():
               and 'id="chpw-title"' in html, f"status={s}")
         check("酒库表单有默认售价输入, 出货行有按行折扣输入",
               'id="w-sale-price"' in html and 'outLineRate(' in html
-              and 'outLineDprice(' in html and 'outLineReason(' in html
-              and '折扣原因' in html, f"status={s}")
+              and 'outLineDprice(' not in html and 'outLineReason(' not in html
+              and '折扣原因' not in html, f"status={s}")
         check("整单级折扣输入已去掉",
               'id="out-rate"' not in html and 'id="out-reason"' not in html
               and 'id="out-discount"' not in html, f"status={s}")
@@ -1197,6 +1208,103 @@ def main():
         check("前端运费分摊逻辑在场",
               "custFreight" in html and "客户付" in html and "我方付" in html
               and "运费记 0" not in html, f"status={s}")
+
+        # 25. v2.8.0: 间距、酒编辑+价格历史、规格、品牌、折后价自动算、单据行快照
+        # 25a. 前端间距: 单据筛选按钮组与卡片有间距; 行内按钮有间距
+        s, html = req("GET", "/")
+        check("单据筛选按钮组与卡片列表有间距",
+              "#page-orders .btn-grid{margin-bottom:10px}" in html, f"status={s}")
+        check("行内并排按钮有间距",
+              ".item>div button{margin-left:6px}" in html, f"status={s}")
+
+        # 25b. 酒编辑 + 价格历史 + 资料更新日期
+        s, w = req("POST", "/api/wines",
+                   {"barcode": "6901234567896", "name": "测试编辑酒",
+                    "capacity_ml": 750, "sale_price": 100}, token=tok)
+        wid_ed = w.get("id")
+        check("建编辑测试酒", s == 200 and wid_ed, f"status={s} {w}")
+        s, ws = req("GET", "/api/wines", token=tok)
+        row = [x for x in ws if x["id"] == wid_ed][0]
+        check("酒列表带回容量 750", row.get("capacity_ml") == 750,
+              f"status={s} {row}")
+        check("酒列表无 brand 字段", "brand" not in row, f"status={s} {row}")
+        s, h = req("GET", f"/api/wines/{wid_ed}/price-history", token=tok)
+        check("初始录入酒不记价格历史", s == 200 and h == [], f"status={s} {h}")
+        s, d = req("POST", "/api/inbound",
+                   {"type": "opening", "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_ed, "qty": 5, "unit_price": 60}]},
+                   token=tok)
+        check("编辑测试酒补登 5 瓶", s == 200, f"status={s} {d}")
+        s, d = req("POST", "/api/outbound",
+                   {"type": "sale", "customer_id": cus, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_ed, "qty": 1, "orig_price": 100}]},
+                   token=tok)
+        old_out_id = d.get("id")
+        check("改价前出单成功", s == 200 and old_out_id, f"status={s} {d}")
+        s, _ = req("PUT", f"/api/wines/{wid_ed}",
+                   {"name": "测试编辑酒改名", "sale_price": 120}, token=tok)
+        s, ws = req("GET", "/api/wines", token=tok)
+        row = [x for x in ws if x["id"] == wid_ed][0]
+        check("酒改名改价生效",
+              s == 200 and row.get("name") == "测试编辑酒改名"
+              and row.get("sale_price") == 120, f"status={s} {row}")
+        check("酒卡片资料更新日期为今天",
+              (row.get("updated_at") or "")[:10] == date.today().isoformat(),
+              f"status={s} {row}")
+        s, h = req("GET", f"/api/wines/{wid_ed}/price-history", token=tok)
+        check("改价记一条价格历史 (100→120, 记操作人)",
+              s == 200 and len(h) == 1 and h[0]["old_price"] == 100
+              and h[0]["new_price"] == 120 and h[0]["changed_by"] == "tristan",
+              f"status={s} {h}")
+        s, d = req("GET", f"/api/outbound/{old_out_id}", token=tok)
+        check("老单行价仍为 100 不动",
+              d["items"][0]["unit_price"] == 100, f"status={s} {d}")
+        check("老单行酒名快照仍为改名前",
+              d["items"][0]["wine_name"] == "测试编辑酒", f"status={s} {d}")
+        s, _ = req("PUT", f"/api/wines/{wid_ed}",
+                   {"description": "只改说明不改价"}, token=tok)
+        s, h = req("GET", f"/api/wines/{wid_ed}/price-history", token=tok)
+        check("只改说明不改价不记价格历史", s == 200 and len(h) == 1,
+              f"status={s} {h}")
+        s, _ = req("PUT", f"/api/wines/{wid_ed}", {"sale_price": 120}, token=tok)
+        s, h = req("GET", f"/api/wines/{wid_ed}/price-history", token=tok)
+        check("改价为同样价格不记历史", s == 200 and len(h) == 1,
+              f"status={s} {h}")
+        s, d = req("POST", "/api/outbound",
+                   {"type": "sale", "customer_id": cus, "warehouse_id": wh1,
+                    "items": [{"wine_id": wid_ed, "qty": 1, "orig_price": 120}]},
+                   token=tok)
+        new_out_id = d.get("id")
+        s, d = req("GET", f"/api/outbound/{new_out_id}", token=tok)
+        check("新单行酒名快照为改名后",
+              d["items"][0]["wine_name"] == "测试编辑酒改名", f"status={s} {d}")
+
+        # 25c. 规格校验: 0/负数/小数/非数字被拒
+        for _bad in (0, -100, 750.5, "abc"):
+            s, d = req("POST", "/api/wines",
+                       {"name": "坏规格酒", "capacity_ml": _bad}, token=tok)
+            check(f"规格 {_bad} 被拒 400", s == 400, f"status={s} {d}")
+
+        # 25d. 规格迁移: 示例酒容量已提为数字
+        s, ws = req("GET", "/api/wines", token=tok)
+        _seed = [x for x in ws if x["barcode"] == "6900000000001"]
+        check("示例红酒迁移后容量 750",
+              bool(_seed) and _seed[0].get("capacity_ml") == 750
+              and _seed[0].get("spec") == "750", f"status={s} {_seed}")
+
+        # 25e. 前端: 酒卡片有编辑入口与资料更新文案, 无品牌栏, 规格为单瓶容量
+        s, html = req("GET", "/")
+        check("酒卡片有编辑入口与资料更新文案",
+              "editWine(" in html and "资料更新" in html
+              and 'id="w-price-hist"' in html, f"status={s}")
+        check("酒表单无品牌/厂家栏, 规格为单瓶容量数字输入",
+              'id="w-brand"' not in html and 'id="w-manu"' not in html
+              and "单瓶容量" in html and "品牌" not in html
+              and 'id="w-spec" type="number"' in html, f"status={s}")
+        check("折后价只读显示由折扣率算, 无折扣原因栏",
+              'class="disc-price"' in html and "折后价 ¥" in html
+              and 'outLineDprice(' not in html and 'outLineReason(' not in html
+              and '折扣原因' not in html, f"status={s}")
 
         # 14. audit_logs 有记录
         s, logs = req("GET", "/api/audit-logs", token=tok)
