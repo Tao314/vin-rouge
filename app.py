@@ -26,7 +26,7 @@ TOKEN_TTL_HOURS = 24
 # ---------- 版本（单点管理） ----------
 # 唯一版本源：只改 APP_VERSION，全仓同步
 # （前端页脚、README、/api/version、/api/config 都以它为准，不要在别处手写版本号）。
-APP_VERSION = "v2.1.3"
+APP_VERSION = "v2.2.0"
 BUILD_DATE = "2026-11-25"
 
 
@@ -422,8 +422,8 @@ async def update_wine(wid: int, request: Request):
             return err("无可更新字段")
         try:
             c.execute(f"UPDATE wines SET {sets}, updated_at=? WHERE id=?",
-                      *([b[f] for f in fields if f in b] +
-                        [datetime.now().isoformat(), wid]))
+                      [b[f] for f in fields if f in b] +
+                      [datetime.now().isoformat(), wid])
         except sqlite3.IntegrityError:
             return err("条码已存在")
         audit(c, u["username"], "修改酒", str(wid), "")
@@ -569,7 +569,7 @@ def party_routes(kind, table):
             return err("无可更新字段")
         with conn() as c:
             c.execute(f"UPDATE {table} SET {sets} WHERE id=?",
-                      *([b[f] for f in fields if f in b] + [pid]))
+                      [b[f] for f in fields if f in b] + [pid])
             audit(c, u["username"], f"修改{'供应商' if kind == 'supplier' else '客户'}",
                   str(pid), "")
             return {"ok": True}
@@ -584,6 +584,40 @@ app.put("/api/suppliers/{pid}")(_sup_update)
 app.get("/api/customers")(_cus_lst)
 app.post("/api/customers")(_cus_create)
 app.put("/api/customers/{pid}")(_cus_update)
+
+
+@app.delete("/api/suppliers/{pid}")
+async def delete_supplier(pid: int, request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        r = c.execute("SELECT * FROM suppliers WHERE id=?", (pid,)).fetchone()
+        if not r:
+            return err("供应商不存在", 404)
+        n = c.execute("SELECT COUNT(*) FROM inbound_orders WHERE supplier_id=? AND type='purchase'", (pid,)).fetchone()[0]
+        if n > 0:
+            return JSONResponse({"detail": "该供应商已有进货单，不能删除"}, status_code=400)
+        c.execute("DELETE FROM suppliers WHERE id=?", (pid,))
+        audit(c, u["username"], "删除供应商", r["name"], "")
+        return {"ok": True}
+
+
+@app.delete("/api/customers/{pid}")
+async def delete_customer(pid: int, request: Request):
+    u, e = await require_user(request)
+    if e:
+        return e
+    with conn() as c:
+        r = c.execute("SELECT * FROM customers WHERE id=?", (pid,)).fetchone()
+        if not r:
+            return err("客户不存在", 404)
+        n = c.execute("SELECT COUNT(*) FROM outbound_orders WHERE customer_id=?", (pid,)).fetchone()[0]
+        if n > 0:
+            return JSONResponse({"detail": "该客户已有出货单，不能删除"}, status_code=400)
+        c.execute("DELETE FROM customers WHERE id=?", (pid,))
+        audit(c, u["username"], "删除客户", r["name"], "")
+        return {"ok": True}
 
 
 # ---------- 库存 / 单据 ----------

@@ -73,11 +73,11 @@ def main():
         s, _ = req("GET", "/api/wines")
         check("未登录调业务接口返回 401", s == 401, f"status={s}")
 
-        # 1b. 版本接口公开返回 v2.1.3（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
+        # 1b. 版本接口公开返回 v2.2.0（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
         s, d = req("GET", "/api/version")
-        check("版本接口 /api/version 返回 v2.1.3", s == 200 and d.get("version") == "v2.1.3", f"status={s} {d}")
+        check("版本接口 /api/version 返回 v2.2.0", s == 200 and d.get("version") == "v2.2.0", f"status={s} {d}")
         s, d = req("GET", "/api/config")
-        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.1.3" and "build_date" in d, f"status={s} {d}")
+        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.2.0" and "build_date" in d, f"status={s} {d}")
 
         # 2. 无默认用户: 首位注册前注册开放, 默认账号登录失败
         s, d = req("GET", "/api/auth/status")
@@ -300,6 +300,68 @@ def main():
                     "items": [{"wine_id": wid, "qty": 1, "orig_price": 200,
                                "discount_rate": 0.9}]}, token=tok)
         check("打折无原因被拒", s == 400, f"status={s} {d}")
+
+        # 13b. 停用后下拉不再出现（前端下拉只取 active 的，后端停用后立即刷新）
+        s, d = req("POST", "/api/customers",
+                   {"name": "临时客户", "phone": "13600000000"}, token=tok)
+        tmp_cus = d.get("id")
+        check("新建临时客户", s == 200 and tmp_cus, f"status={s} {d}")
+        s, _ = req("PUT", f"/api/customers/{tmp_cus}", {"active": 0}, token=tok)
+        check("停用临时客户", s == 200, f"status={s}")
+        s, cuss = req("GET", "/api/customers", None, token=tok)
+        row = [c for c in cuss if c["id"] == tmp_cus][0]
+        check("停用后客户 active 为 0", row["active"] == 0, f"status={s} {row}")
+        visible = [c for c in cuss if c["active"]]
+        check("停用后下拉（仅 active）不再出现该客户",
+              all(c["id"] != tmp_cus for c in visible), f"status={s}")
+        s, _ = req("PUT", f"/api/customers/{tmp_cus}", {"active": 1}, token=tok)
+        check("重新启用客户", s == 200, f"status={s}")
+
+        # 13c. 客户改名
+        s, _ = req("PUT", f"/api/customers/{tmp_cus}", {"name": "临时客户改名"}, token=tok)
+        check("客户改名", s == 200, f"status={s}")
+        s, cuss = req("GET", "/api/customers", None, token=tok)
+        row = [c for c in cuss if c["id"] == tmp_cus][0]
+        check("改名后客户名已更新", row["name"] == "临时客户改名", f"status={s} {row}")
+
+        # 13d. 客户无单可删、有单拒删
+        s, _ = req("DELETE", f"/api/customers/{tmp_cus}", None, token=tok)
+        check("无单客户可删除", s == 200, f"status={s}")
+        s, cuss = req("GET", "/api/customers", None, token=tok)
+        check("删除后客户不在列表", all(c["id"] != tmp_cus for c in cuss), f"status={s}")
+        s, d = req("DELETE", f"/api/customers/{cus}", None, token=tok)
+        check("有出货单的客户拒删 400", s == 400, f"status={s} {d}")
+        s, _ = req("DELETE", "/api/customers/99999", None, token=tok)
+        check("删除不存在的客户 404", s == 404, f"status={s}")
+
+        # 13e. 供应商改名、可删、拒删
+        s, d = req("POST", "/api/suppliers",
+                   {"name": "临时供应商", "phone": "13700000000"}, token=tok)
+        tmp_sup = d.get("id")
+        check("新建临时供应商", s == 200 and tmp_sup, f"status={s} {d}")
+        s, _ = req("PUT", f"/api/suppliers/{tmp_sup}", {"name": "临时供应商改名"}, token=tok)
+        check("供应商改名", s == 200, f"status={s}")
+        s, sups = req("GET", "/api/suppliers", None, token=tok)
+        row = [x for x in sups if x["id"] == tmp_sup][0]
+        check("改名后供应商名已更新", row["name"] == "临时供应商改名", f"status={s} {row}")
+        s, _ = req("DELETE", f"/api/suppliers/{tmp_sup}", None, token=tok)
+        check("无单供应商可删除", s == 200, f"status={s}")
+        s, d = req("DELETE", f"/api/suppliers/{sup}", None, token=tok)
+        check("有进货单的供应商拒删 400", s == 400, f"status={s} {d}")
+        s, _ = req("DELETE", "/api/suppliers/99999", None, token=tok)
+        check("删除不存在的供应商 404", s == 404, f"status={s}")
+
+        # 13f. 供应商停用后下拉不再出现
+        s, d = req("POST", "/api/suppliers",
+                   {"name": "临时供应商2", "phone": "13700000001"}, token=tok)
+        tmp_sup2 = d.get("id")
+        s, _ = req("PUT", f"/api/suppliers/{tmp_sup2}", {"active": 0}, token=tok)
+        s, sups = req("GET", "/api/suppliers", None, token=tok)
+        visible = [x for x in sups if x["active"]]
+        check("停用后供应商下拉（仅 active）不再出现",
+              all(x["id"] != tmp_sup2 for x in visible), f"status={s}")
+        s, _ = req("DELETE", f"/api/suppliers/{tmp_sup2}", None, token=tok)
+        check("停用后无单供应商仍可删除", s == 200, f"status={s}")
 
         # 14. audit_logs 有记录
         s, logs = req("GET", "/api/audit-logs", token=tok)
