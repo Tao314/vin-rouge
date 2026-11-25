@@ -6,7 +6,7 @@ set -e
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 cd "$(dirname "$0")"
 $SUDO mkdir -p /opt/vin-rouge
-$SUDO cp -r app.py static requirements.txt install.sh backup.sh /opt/vin-rouge/
+if [ "$(pwd)" != "/opt/vin-rouge" ]; then $SUDO cp -r app.py static requirements.txt install.sh backup.sh /opt/vin-rouge/; fi
 cd /opt/vin-rouge
 python3 -m venv .venv 2>/dev/null || true
 ./.venv/bin/pip install -q -r requirements.txt
