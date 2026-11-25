@@ -73,11 +73,11 @@ def main():
         s, _ = req("GET", "/api/wines")
         check("未登录调业务接口返回 401", s == 401, f"status={s}")
 
-        # 1b. 版本接口公开返回 v2.5.1（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
+        # 1b. 版本接口公开返回 v2.5.2（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
         s, d = req("GET", "/api/version")
-        check("版本接口 /api/version 返回 v2.5.1", s == 200 and d.get("version") == "v2.5.1", f"status={s} {d}")
+        check("版本接口 /api/version 返回 v2.5.2", s == 200 and d.get("version") == "v2.5.2", f"status={s} {d}")
         s, d = req("GET", "/api/config")
-        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.5.1" and "build_date" in d, f"status={s} {d}")
+        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.5.2" and "build_date" in d, f"status={s} {d}")
 
         # 2. 无默认用户: 首位注册前注册开放, 默认账号登录失败
         s, d = req("GET", "/api/auth/status")
@@ -757,8 +757,9 @@ def main():
               'background:#fff' in ghost_rule and 'color:#7b1e26' in ghost_rule
               and 'border:1px solid #7b1e26' in ghost_rule
               and '#F2F3F5' not in css, f"ghost={ghost_rule}")
-        check("按钮组都用等宽网格: 管理页 g5 / 单据筛选 g3 / 付款快捷 g3 / 补登原因 g2",
-              html.count('class="btn-grid g5"') == 1
+        check("按钮组都用等宽网格: 管理页 g4 / 单据筛选 g3 / 付款快捷 g3 / 补登原因 g2",
+              html.count('class="btn-grid g4"') == 1
+              and html.count('class="btn-grid g5"') == 0
               and html.count('class="btn-grid g3"') == 3
               and html.count('class="btn-grid g2"') == 1, f"status={s}")
         btn_classes = sorted(set(_re.findall(r'<button[^>]*class="([^"]*)"', html)))
@@ -769,6 +770,15 @@ def main():
         check("表单主按钮统一全宽, 保存+取消成对等宽",
               html.count('class="btn-block"') >= 7
               and html.count('class="btn-pair"') == 3, f"status={s}")
+        # 21m. v2.5.2: 按钮文字不许换行
+        btn_rule = _re.search(r'(?:^|\n)button\{([^}]*)\}', css).group(1)
+        grid_btn_rule = _re.search(r'\.btn-grid button\{([^}]*)\}', css).group(1)
+        check("按钮文字不许换行: 全站 button 有 white-space:nowrap",
+              'white-space:nowrap' in btn_rule, f"button={btn_rule}")
+        check("管理页按钮组是 4 列等宽网格, 网格按钮横向内边距已减小",
+              '.btn-grid.g4{grid-template-columns:repeat(4,1fr)}' in css
+              and html.count('class="btn-grid g4"') == 1
+              and 'padding:9px 4px' in grid_btn_rule, f"grid_btn={grid_btn_rule}")
 
         # 21j. 用户信息无 display_name
         s, us = req("GET", "/api/users", token=tok)
