@@ -26,7 +26,7 @@ TOKEN_TTL_HOURS = 24
 # ---------- 版本（单点管理） ----------
 # 唯一版本源：只改 APP_VERSION，全仓同步
 # （前端页脚、README、/api/version、/api/config 都以它为准，不要在别处手写版本号）。
-APP_VERSION = "v2.1.2"
+APP_VERSION = "v2.1.3"
 BUILD_DATE = "2026-11-25"
 
 
@@ -68,10 +68,10 @@ def init_db():
         CREATE TABLE IF NOT EXISTS warehouses(
           id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, active INTEGER DEFAULT 1);
         CREATE TABLE IF NOT EXISTS suppliers(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, contact TEXT,
+          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
           phone TEXT, address TEXT, note TEXT, active INTEGER DEFAULT 1);
         CREATE TABLE IF NOT EXISTS customers(
-          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, contact TEXT,
+          id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
           phone TEXT, address TEXT, note TEXT, active INTEGER DEFAULT 1);
         CREATE TABLE IF NOT EXISTS stock(
           warehouse_id INTEGER, wine_id INTEGER, batch TEXT DEFAULT '',
@@ -125,10 +125,10 @@ def init_db():
         # 示例数据只在仓库表为空时插一次, 与用户数无关, 避免重复插.
         if c.execute("SELECT COUNT(*) FROM warehouses").fetchone()[0] == 0:
             c.execute("INSERT INTO warehouses(name) VALUES('主仓'),('副仓')")
-            c.execute("INSERT INTO suppliers(name,contact,phone,note) VALUES"
-                      "('示例供应商','张经理','13800000000','示例数据')")
-            c.execute("INSERT INTO customers(name,contact,phone,note) VALUES"
-                      "('示例客户','李老板','13900000000','示例数据')")
+            c.execute("INSERT INTO suppliers(name,phone,note) VALUES"
+                      "('示例供应商','13800000000','示例数据')")
+            c.execute("INSERT INTO customers(name,phone,note) VALUES"
+                      "('示例客户','13900000000','示例数据')")
             now = datetime.now().isoformat()
             c.execute("INSERT INTO wines(barcode,name,brand,spec,origin,description,"
                       "created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
@@ -550,9 +550,9 @@ def party_routes(kind, table):
         if not b.get("name"):
             return err("名称必填")
         with conn() as c:
-            cur = c.execute(f"INSERT INTO {table}(name,contact,phone,address,note)"
-                            " VALUES(?,?,?,?,?)",
-                            (b["name"], b.get("contact"), b.get("phone"),
+            cur = c.execute(f"INSERT INTO {table}(name,phone,address,note)"
+                            " VALUES(?,?,?,?)",
+                            (b["name"], b.get("phone"),
                              b.get("address"), b.get("note")))
             audit(c, u["username"], f"新增{'供应商' if kind == 'supplier' else '客户'}",
                   b["name"], "")
@@ -563,7 +563,7 @@ def party_routes(kind, table):
         if e:
             return e
         b = await request.json()
-        fields = ["name", "contact", "phone", "address", "note", "active"]
+        fields = ["name", "phone", "address", "note", "active"]
         sets = ", ".join(f"{f}=?" for f in fields if f in b)
         if not sets:
             return err("无可更新字段")
