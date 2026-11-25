@@ -26,7 +26,7 @@ TOKEN_TTL_HOURS = 24
 # ---------- 版本（单点管理） ----------
 # 唯一版本源：只改 APP_VERSION，全仓同步
 # （前端页脚、README、/api/version、/api/config 都以它为准，不要在别处手写版本号）。
-APP_VERSION = "v2.6.0"
+APP_VERSION = "v2.7.0"
 BUILD_DATE = "2026-11-25"
 
 
@@ -145,6 +145,7 @@ def init_db():
                 ("inbound_items", "confirmed_qty", "INTEGER DEFAULT 0"),
                 ("outbound_orders", "status", "TEXT DEFAULT 'pending'"),
                 ("outbound_items", "confirmed_qty", "INTEGER DEFAULT 0"),
+                ("outbound_orders", "freight_rule", "INTEGER DEFAULT 0"),
                 ("transfers", "status", "TEXT DEFAULT 'pending'")):
             _cols = [r[1] for r in c.execute(f"PRAGMA table_info({_t})")]
             if _col not in _cols:
@@ -646,6 +647,11 @@ def party_routes(kind, table):
                                   " ON o.id=i.order_id WHERE o.customer_id=?"
                                   " AND o.type='sale' AND COALESCE(o.voided,0)=0",
                                   (p["id"],)).fetchone()["tot"]
+                    # 客户付的运费: 整单确认完后计入欠款, 包邮的我方付不计入
+                    for _o in rows(c, "SELECT id FROM outbound_orders"
+                                    " WHERE customer_id=? AND type='sale'"
+                                    " AND COALESCE(voided,0)=0", (p["id"],)):
+                        t += customer_freight_due(c, _o["id"])
                     paid = c.execute("SELECT COALESCE(SUM(p.amount),0) s FROM payments p "
                                      "JOIN outbound_orders o ON o.id=p.order_id "
                                      "WHERE p.order_type='outbound' AND o.customer_id=?"
@@ -825,9 +831,28 @@ def confirmed_total(c, table, items_table, oid):
     return r["s"]
 
 
+def customer_freight_due(c, oid):
+    """销售单客户应付运费: 只对新规则单 (freight_rule=1) 生效, 老单返回 0;
+    不包邮时运费是实际金额, 首次确认即整单计入欠款一次 (后续分批确认不再
+    重复加); 未确认、包邮、废单不计."""
+    o = c.execute("SELECT * FROM outbound_orders WHERE id=?", (oid,)).fetchone()
+    if not o or o["voided"] or o["type"] != "sale" or o["freight_free"]:
+        return 0.0
+    if not o["freight_rule"]:
+        return 0.0
+    r = c.execute("SELECT COALESCE(SUM(confirmed_qty),0) cq"
+                  " FROM outbound_items WHERE order_id=?", (oid,)).fetchone()
+    if r["cq"] <= 0:
+        return 0.0
+    return float(o["freight"] or 0)
+
+
 def pay_status_confirmed(c, table, items_table, oid, paid):
-    """按已确认货值算付款状态: 没确认过时已付算预付, 显示 partial."""
+    """按已确认货值算付款状态: 没确认过时已付算预付, 显示 partial.
+    销售单整单确认完后, 客户付的运费也计入应付."""
     tot = confirmed_total(c, table, items_table, oid)
+    if table == "outbound_orders":
+        tot += customer_freight_due(c, oid)
     if tot <= 0:
         return "unpaid" if paid <= 0 else "partial"
     return pay_status(paid, tot)
@@ -893,12 +918,25 @@ async def dashboard(request: Request):
                            " WHERE oc.order_type='outbound' AND o.type='sale'"
                            " AND substr(oc.created_at,1,10)=?",
                            (today,)).fetchone()["s"]
-        # 欠款: 只算已确认货值 - 已付 (未确认的单不计入)
+        # 利润扣实际运费: order_confirms.profit 是纯商品毛利 (不含运费);
+        # 客户付的运费已含在总金额里, 与实际运费抵消后净为 0, 所以只扣包邮单
+        # (我方承担) 的实际运费; 整单运费只在首次确认当天扣一次.
+        freight_today = c.execute(
+            "SELECT COALESCE(SUM(o.freight),0) s FROM outbound_orders o"
+            " WHERE o.type='sale' AND COALESCE(o.voided,0)=0"
+            " AND o.freight_rule=1 AND o.freight_free=1"
+            " AND (SELECT MIN(substr(oc2.created_at,1,10)) FROM order_confirms oc2"
+            "      WHERE oc2.order_type='outbound' AND oc2.order_id=o.id) = ?",
+            (today,)).fetchone()["s"]
+        profit = round(profit - freight_today, 2)
+        # 欠款: 只算已确认货值 - 已付 (未确认的单不计入);
+        # 销售单整单确认完后, 客户付的运费也计入客户欠款
         cust_debt = 0.0
         for o in rows(c, "SELECT id FROM outbound_orders"
                          " WHERE type='sale' AND COALESCE(voided,0)=0"):
             cust_debt += (confirmed_total(c, "outbound_orders", "outbound_items",
                                           o["id"])
+                          + customer_freight_due(c, o["id"])
                           - paid_total(c, "outbound", o["id"]))
         sup_debt = 0.0
         for o in rows(c, "SELECT id FROM inbound_orders"
@@ -949,7 +987,8 @@ async def create_inbound(request: Request):
     items = b.get("items") or []
     if not items:
         return err("至少一行商品")
-    freight = 0.0 if b.get("freight_free") else float(b.get("freight") or 0)
+    # 进货运费: 始终是实际金额, 肯定我方付; 填 0 就是包邮 (不再有包邮勾选)
+    freight = float(b.get("freight") or 0)
     goods = sum(float(i.get("qty", 0)) * float(i.get("unit_price") or 0)
                 for i in items)
     with conn() as c:
@@ -967,8 +1006,8 @@ async def create_inbound(request: Request):
             "goods_total,pay_status,note,created_at,status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (no, typ, b.get("supplier_id"), b.get("warehouse_id"),
              b.get("order_date") or date.today().isoformat(), b.get("carrier"),
-             b.get("tracking_no"), freight, 1 if b.get("freight_free") else 0,
-             b.get("freight_payer"), round(goods, 2), "unpaid", b.get("note"),
+             b.get("tracking_no"), freight, 0, "我方",
+             round(goods, 2), "unpaid", b.get("note"),
              datetime.now().isoformat(), status))
         oid = cur.lastrowid
         for i in items:
@@ -1097,13 +1136,17 @@ async def create_outbound(request: Request):
                               "qty": qty, "unit_price": 0.0, "orig_price": 0.0,
                               "discount_rate": None, "discount_amount": 0.0,
                               "cost_price": cost, "reason": reason or None})
+        free = bool(b.get("freight_free")) if typ == "sale" else False
         if typ == "sale":
-            freight = 0.0 if b.get("freight_free") else float(b.get("freight") or 0)
+            # 出货运费: 始终是实际金额; 包邮只决定谁付 (包邮=我方, 不包邮=客户)
+            freight = float(b.get("freight") or 0)
+            payer = "我方" if free else "客户"
             total = round(sum(l["qty"] * l["unit_price"] for l in lines), 2)
             orig_total = round(sum(l["qty"] * l["orig_price"] for l in lines), 2)
             disc_total = round(sum(l["discount_amount"] for l in lines), 2)
         else:
             freight, total, orig_total, disc_total = 0.0, 0.0, 0.0, 0.0
+            payer = None
         cost_total = round(sum(l["qty"] * l["cost_price"] for l in lines), 2)
         no = next_order_no(c, "outbound_orders", "CK")
         # 两段式: sale 下单时状态待出货, 不减库存、不算欠款, 确认出货才动;
@@ -1113,11 +1156,11 @@ async def create_outbound(request: Request):
             "INSERT INTO outbound_orders(order_no,type,customer_id,warehouse_id,"
             "order_date,carrier,tracking_no,freight,freight_free,freight_payer,"
             "sale_total,orig_total,discount_total,cost_total,pay_status,note,created_at,"
-            "status) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "status,freight_rule) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)",
             (no, typ, b.get("customer_id") if typ in ("sale", "gift") else None,
              wh, b.get("order_date") or date.today().isoformat(),
              b.get("carrier"), b.get("tracking_no"), freight,
-             1 if b.get("freight_free") else 0, b.get("freight_payer"),
+             1 if free else 0, payer,
              total, orig_total, disc_total, cost_total,
              "unpaid" if typ == "sale" else "paid",
              b.get("note"), datetime.now().isoformat(), status))
@@ -1591,7 +1634,9 @@ async def share_png(otype: str, oid: int, request: Request):
                 else:
                     lines.append(f"{it['wine_name']} {it.get('spec') or ''} x{it['qty']} "
                                  f"单价{it['unit_price']:.2f} 小计{it['qty']*it['unit_price']:.2f}")
-            total = d["sale_total"]
+            # 分享图总金额 = 折后货款 + 客户付运费 (新规则单; 老单按原规则只含货款)
+            total = d["sale_total"] + (0 if d.get("freight_free") or not d.get("freight_rule")
+                                      else (d["freight"] or 0))
             lines += [f"货款合计: {total:.2f} 元"]
             if (d.get("discount_total") or 0) > 0:
                 lines.append(f"其中折扣: {d['discount_total']:.2f} 元"

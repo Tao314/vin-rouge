@@ -91,7 +91,7 @@ details summary{cursor:pointer;font-size:13px;color:#667085;padding:6px 0}
 <div class="card"><h3>低库存提醒（&lt;5 瓶）</h3><div id="lowstock"></div></div>
 </div>
 
-<div id="page-wines" class="hidden"><div class="card"><h2>酒库</h2>
+<div id="page-wines" class="hidden"><div class="card">
 <label>条码</label><input id="w-barcode" placeholder="扫码或输入条码"><button class="ghost btn-block" onclick="lookupBarcode()">扫条码查网上信息</button>
 <label>酒名 *</label><input id="w-name"><label>品牌</label><input id="w-brand">
 <label>规格（如 750ml*6瓶/箱）</label><input id="w-spec">
@@ -102,17 +102,17 @@ details summary{cursor:pointer;font-size:13px;color:#667085;padding:6px 0}
 <button class="btn-block" onclick="saveWine()">保存酒</button><p id="w-msg" class="muted"></p></div>
 <div class="card"><h3>酒列表</h3><div id="wine-list"></div></div></div>
 
-<div id="page-suppliers" class="hidden"><div class="card"><h2>供应商</h2><div id="sup-list"></div>
+<div id="page-suppliers" class="hidden"><div class="card"><div id="sup-list"></div>
 <label>名称 *</label><input id="s-name">
 <label>电话</label><input id="s-phone"><label>地址</label><input id="s-addr">
 <div class="btn-pair"><button id="s-save-btn" onclick="saveParty('suppliers')">新增供应商</button><button class="ghost hidden" id="s-cancel-btn" onclick="cancelEditParty()">取消修改</button></div></div></div>
 
-<div id="page-customers" class="hidden"><div class="card"><h2>客户</h2><div id="cus-list"></div>
+<div id="page-customers" class="hidden"><div class="card"><div id="cus-list"></div>
 <label>名称 *</label><input id="c-name">
 <label>电话</label><input id="c-phone"><label>地址</label><input id="c-addr">
 <div class="btn-pair"><button id="c-save-btn" onclick="saveParty('customers')">新增客户</button><button class="ghost hidden" id="c-cancel-btn" onclick="cancelEditParty()">取消修改</button></div></div></div>
 
-<div id="page-inbound" class="hidden"><div class="card"><h2>进货单</h2>
+<div id="page-inbound" class="hidden"><div class="card">
 <label>供应商</label><select id="in-sup"></select>
 <label>仓库</label><select id="in-wh"></select>
 <label>日期</label><input id="in-date" type="date">
@@ -121,16 +121,15 @@ details summary{cursor:pointer;font-size:13px;color:#667085;padding:6px 0}
 <div id="in-total" class="muted"></div>
 <details id="in-logi"><summary>物流信息（可选，点开展开）</summary>
 <label>物流公司</label><input id="in-carrier"><label>物流单号</label><input id="in-track">
-<label>运费（元）</label><input id="in-freight" type="number" step="0.01" value="0">
-<label><input type="checkbox" id="in-free" style="width:auto"> 包邮（运费记 0）</label>
-<label>谁付运费</label><input id="in-payer" placeholder="如：我方 / 供应商"></details>
+<label>实际运费（元）</label><input id="in-freight" type="number" step="0.01" value="0">
+<p class="muted">固定由我方承担，不计入供应商欠款；填 0 表示无运费。</p></details>
 <label>本次已付货款（元，可 0）</label><input id="in-paid" type="number" step="0.01" value="0">
 <div class="btn-grid g3"><button class="ghost" onclick="setInPaid(0)">未付</button><button class="ghost" onclick="setInPaid('half')">部分付</button><button class="ghost" onclick="setInPaid('full')">已付清</button></div>
 <label>备注</label><input id="in-note">
 <div class="sticky-bar"><div id="in-total-line"><b>货款合计 ¥0</b></div><button onclick="submitInbound()">提交进货</button></div>
 <p id="in-msg"></p></div></div>
 
-<div id="page-opening" class="hidden"><div class="card"><h2>库存补登（期初）</h2>
+<div id="page-opening" class="hidden"><div class="card">
 <p class="muted">增加库存模式：补登数量会加到现有库存上，不会覆盖原有库存。</p>
 <label>仓库</label><select id="op-wh" onchange="opStockNow()"></select>
 <label>酒</label><select id="op-wine" onchange="opStockNow()"></select>
@@ -144,7 +143,7 @@ details summary{cursor:pointer;font-size:13px;color:#667085;padding:6px 0}
 <label>备注</label><input id="op-note">
 <button class="btn-block" onclick="submitOpening()">提交补登</button><p id="op-msg"></p></div></div>
 
-<div id="page-outbound" class="hidden"><div class="card"><h2>出货单</h2>
+<div id="page-outbound" class="hidden"><div class="card">
 <label>出库类型</label><select id="out-type" onchange="outTypeChanged()">
 <option value="sale">销售出库</option><option value="personal">自饮</option>
 <option value="gift">赠送</option><option value="damage">破损</option></select>
@@ -154,9 +153,9 @@ details summary{cursor:pointer;font-size:13px;color:#667085;padding:6px 0}
 <div id="out-items" class="out-lines"></div>
 <button class="ghost btn-block" onclick="addOutLine()">＋ 添加酒品</button>
 <div id="out-logi-wrap"><label>物流公司</label><input id="out-carrier"><label>物流单号</label><input id="out-track">
-<label>运费（元）</label><input id="out-freight" type="number" step="0.01" value="0">
-<label><input type="checkbox" id="out-free" style="width:auto"> 包邮（运费记 0）</label>
-<label>谁付运费</label><input id="out-payer" placeholder="如：我方 / 客户"></div>
+<label>实际运费（元）</label><input id="out-freight" type="number" step="0.01" value="0" oninput="updateOutSummary()">
+<p class="muted">填写实际物流费用；包邮表示由我方承担，并非运费为 0。</p>
+<label><input type="checkbox" id="out-free" style="width:auto" onchange="updateOutSummary()"> 包邮（我方付运费）</label></div>
 <div id="out-pay-wrap"><label>本次已收货款（元，可 0）</label><input id="out-paid" type="number" step="0.01" value="0" oninput="updateOutSummary()">
 <div class="btn-grid g3"><button class="ghost" onclick="setOutPaid(0)">未付</button><button class="ghost" onclick="setOutPaid('half')">部分付</button><button class="ghost" onclick="setOutPaid('full')">已付清</button></div></div>
 <div id="out-reason-wrap" class="hidden"><label>破损原因 *</label><input id="out-damage-reason" placeholder="如：搬运摔了"></div>
@@ -165,7 +164,7 @@ details summary{cursor:pointer;font-size:13px;color:#667085;padding:6px 0}
 <div class="sticky-bar"><div id="out-total-line"><b>总金额 ¥0 · 欠款 ¥0</b></div><button onclick="submitOutbound()">提交出货</button></div>
 <p id="out-msg"></p></div></div>
 
-<div id="page-transfer" class="hidden"><div class="card"><h2>调拨</h2>
+<div id="page-transfer" class="hidden"><div class="card">
 <label>酒</label><select id="tr-wine"></select>
 <label>从仓库</label><select id="tr-from"></select>
 <label>到仓库</label><select id="tr-to"></select>
@@ -176,25 +175,25 @@ details summary{cursor:pointer;font-size:13px;color:#667085;padding:6px 0}
 <div class="btn-grid g3"><button class="ghost" onclick="loadOrders('inbound')">进货/补登单</button><button class="ghost" onclick="loadOrders('outbound')">出货单</button><button class="ghost" onclick="loadOrders('transfers')">调拨单</button></div>
 <div id="order-list"></div></div></div>
 
-<div id="page-admin" class="hidden"><div class="card"><h2>管理</h2>
+<div id="page-admin" class="hidden"><div class="card">
 <p class="muted">酒、补登、往来单位、仓库、记录和用户都在这里管。</p>
 <div class="btn-grid g4"><button onclick="show('wines')">酒库</button><button onclick="show('opening')">补登</button><button onclick="show('suppliers')">供应商</button><button onclick="show('customers')">客户</button><button onclick="show('warehouses')">仓库</button><button onclick="show('audit')">操作记录</button><button onclick="show('users')">用户管理</button><button onclick="showChpw()">改密码</button></div></div></div>
 
-<div id="page-warehouses" class="hidden"><div class="card"><h2>仓库管理</h2><div id="wh-list"></div>
+<div id="page-warehouses" class="hidden"><div class="card"><div id="wh-list"></div>
 <label>仓库名称 *</label><input id="wh-name" placeholder="如：主仓 / 门店仓">
 <div class="btn-pair"><button id="wh-save-btn" onclick="saveWh()">新增仓库</button><button class="ghost hidden" id="wh-cancel-btn" onclick="cancelEditWh()">取消改名</button></div>
 <p class="muted">删除条件：库存为零、没有未确认的单子指着它、且不是最后一个仓库。</p></div></div>
 
-<div id="page-inventory" class="hidden"><div class="card"><h2>库存</h2>
+<div id="page-inventory" class="hidden"><div class="card">
 <p class="muted">按仓库查看每种酒的库存，只读；改库存请走补登和调拨。</p><div id="inv-list"></div></div></div>
 
-<div id="page-users" class="hidden"><div class="card"><h2>用户管理（所有管理员权限相同）</h2>
+<div id="page-users" class="hidden"><div class="card"><p class="muted">所有管理员权限相同</p>
 <div id="user-list"></div>
 <label>用户名 *</label><input id="u-name">
 <label>密码 *</label><input id="u-pw" type="password">
 <button class="btn-block" onclick="saveUser()">新增管理员</button></div></div>
 
-<div id="page-audit" class="hidden"><div class="card"><h2>操作记录</h2><div id="audit-list"></div></div></div>
+<div id="page-audit" class="hidden"><div class="card"><div id="audit-list"></div></div></div>
 </div>
 <footer class="muted" style="text-align:center;padding:8px 0 16px">vin-rouge <span id="ver">…</span></footer>
 </main>
@@ -231,16 +230,16 @@ async function loadParties(kind){const ps=await api('/api/'+kind);const el=kind=
 async function toggleParty(kind,id,active){try{await api(`/api/${kind}/${id}`,'PUT',{active});loadParties(kind);loadFormOptions();showToast(active?'已启用':'已停用');}catch(e){showToast('失败：'+e.message);}}
 async function saveParty(kind){const isEdit=editPartyKind===kind&&editPartyId;const p=kind==='suppliers'?{name:$('s-name').value,phone:$('s-phone').value,address:$('s-addr').value}:{name:$('c-name').value,phone:$('c-phone').value,address:$('c-addr').value};try{if(isEdit){await api('/api/'+kind+'/'+editPartyId,'PUT',p);showToast('已更新');}else{await api('/api/'+kind,'POST',p);showToast(kind==='suppliers'?'供应商已新增':'客户已新增');}cancelEditParty();loadParties(kind);loadFormOptions();}catch(e){showToast('失败：'+e.message);}}
 async function loadFormOptions(){const [wh,wines,sups,cuss,stock]=await Promise.all([api('/api/warehouses'),api('/api/wines'),api('/api/suppliers'),api('/api/customers'),api('/api/stock')]);_whs=wh;_wines=wines;_sups=sups;_cuss=cuss;_stockMap={};stock.forEach(s=>{_stockMap[s.warehouse_id+':'+s.wine_id]=s.quantity;});const whO=wh.map(w=>`<option value="${w.id}">${w.name}</option>`).join('');const wO=wines.map(w=>`<option value="${w.id}">${w.name} ${w.spec||''}（库存${w.stock_total}）</option>`).join('');setSel('in-wh',whO);setSel('op-wh',whO);setSel('out-wh',whO);setSel('tr-from',whO);setSel('tr-to',whO);setSel('op-wine',wO);setSel('tr-wine',wO);$('in-sup').innerHTML=sups.filter(s=>s.active).map(s=>`<option value="${s.id}">${s.name}</option>`).join('');$('out-cus').innerHTML=cuss.filter(s=>s.active).map(s=>`<option value="${s.id}">${s.name}</option>`).join('');applyDefaults();if(!$('page-inbound').classList.contains('hidden'))renderInLines();if(!$('page-outbound').classList.contains('hidden'))renderOutLines();opStockNow();}
-async function submitInbound(){try{const items=inLines.filter(l=>l.wine).map(l=>({wine_id:+l.wine,qty:+l.qty||0,unit_price:+l.price||0}));if(!items.length)throw new Error('请先添加酒品');if(items.some(i=>i.qty<=0))throw new Error('数量必须大于 0');const paid=+$('in-paid').value||0;const d=await api('/api/inbound','POST',{type:'purchase',supplier_id:+$('in-sup').value,warehouse_id:+$('in-wh').value,order_date:$('in-date').value||undefined,carrier:$('in-carrier').value,tracking_no:$('in-track').value,freight:+$('in-freight').value||0,freight_free:$('in-free').checked,freight_payer:$('in-payer').value,paid_amount:paid,note:$('in-note').value,idempotency_key:inKey,items});localStorage.setItem('vr_last_wh',String($('in-wh').value));if($('in-carrier').value)localStorage.setItem('vr_last_carrier',$('in-carrier').value);$('in-msg').textContent='已生成进货单 '+d.order_no+(d.duplicate?'（已生成过，直接返回原单）':'');showToast('已生成进货单 '+d.order_no);inLines=[{wine:'',qty:1,price:''}];renderInLines();$('in-paid').value='0';inKey=newKey();}catch(e){$('in-msg').textContent='失败：'+e.message;showToast('失败：'+e.message);}}
+async function submitInbound(){try{const items=inLines.filter(l=>l.wine).map(l=>({wine_id:+l.wine,qty:+l.qty||0,unit_price:+l.price||0}));if(!items.length)throw new Error('请先添加酒品');if(items.some(i=>i.qty<=0))throw new Error('数量必须大于 0');const paid=+$('in-paid').value||0;const d=await api('/api/inbound','POST',{type:'purchase',supplier_id:+$('in-sup').value,warehouse_id:+$('in-wh').value,order_date:$('in-date').value||undefined,carrier:$('in-carrier').value,tracking_no:$('in-track').value,freight:+$('in-freight').value||0,paid_amount:paid,note:$('in-note').value,idempotency_key:inKey,items});localStorage.setItem('vr_last_wh',String($('in-wh').value));if($('in-carrier').value)localStorage.setItem('vr_last_carrier',$('in-carrier').value);$('in-msg').textContent='已生成进货单 '+d.order_no+(d.duplicate?'（已生成过，直接返回原单）':'');showToast('已生成进货单 '+d.order_no);inLines=[{wine:'',qty:1,price:''}];renderInLines();$('in-paid').value='0';inKey=newKey();}catch(e){$('in-msg').textContent='失败：'+e.message;showToast('失败：'+e.message);}}
 async function submitOpening(){try{const qty=+$('op-qty').value||0;if(qty<=0)throw new Error('补登数量必须大于 0');const reason=$('op-reason').value.trim();const note=((reason?'补登原因：'+reason+'；':'')+$('op-note').value).trim();const d=await api('/api/inbound','POST',{type:'opening',warehouse_id:+$('op-wh').value,order_date:$('op-date').value||undefined,batch:$('op-batch').value,paid_amount:0,note:note||undefined,items:[{wine_id:+$('op-wine').value,qty:qty,unit_price:+$('op-price').value||0,batch:$('op-batch').value}],idempotency_key:opKey});localStorage.setItem('vr_last_wh',String($('op-wh').value));$('op-msg').textContent='已生成补登单 '+d.order_no+(d.duplicate?'（已生成过，直接返回原单）':'');showToast('已生成补登单 '+d.order_no);opKey=newKey();opStockNow();}catch(e){$('op-msg').textContent='失败：'+e.message;showToast('失败：'+e.message);}}
 function outTypeChanged(){const t=$('out-type').value;$('out-cus-wrap').classList.toggle('hidden',t==='personal'||t==='damage');$('out-logi-wrap').classList.toggle('hidden',t!=='sale');$('out-pay-wrap').classList.toggle('hidden',t!=='sale');$('out-reason-wrap').classList.toggle('hidden',t!=='damage');renderOutLines();}
-async function submitOutbound(){try{const typ=$('out-type').value;if(typ==='gift'&&!$('out-cus').value)throw new Error('赠送必须选择客户');if(typ==='damage'&&!$('out-damage-reason').value.trim())throw new Error('破损必须填写破损原因');const items=outLines.filter(l=>l.wine).map((l,idx)=>{const it={wine_id:+l.wine,qty:+l.qty||0,unit_price:+(l.price||0)};if(typ==='sale'){it.orig_price=it.unit_price;const rate=(l.rate||'').toString().trim(),dp=(l.dprice||'').toString().trim();if(rate&&dp)throw new Error('第'+(idx+1)+'行折扣率和折后价只能填一个');if(rate){const r=+rate;if(!(r>0&&r<=1))throw new Error('第'+(idx+1)+'行折扣率须在 0 到 1 之间');it.discount_rate=r;}if(dp){const f=+dp;if(f<0||f>it.unit_price)throw new Error('第'+(idx+1)+'行折后价须在 0 到原价之间');it.discount_price=f;}if((rate||dp)&&!(l.reason||'').trim())throw new Error('第'+(idx+1)+'行打折需填写折扣原因');if(l.reason)it.reason=(l.reason||'').trim();}if(typ==='damage')it.reason=$('out-damage-reason').value.trim();return it;});if(!items.length)throw new Error('请先添加酒品');if(items.some(i=>i.qty<=0))throw new Error('数量必须大于 0');const d=await api('/api/outbound','POST',{type:typ,customer_id:(typ==='sale'||typ==='gift')?+$('out-cus').value:undefined,warehouse_id:+$('out-wh').value,order_date:$('out-date').value||undefined,carrier:$('out-carrier').value,tracking_no:$('out-track').value,freight:+$('out-freight').value||0,freight_free:$('out-free').checked,freight_payer:$('out-payer').value,paid_amount:+$('out-paid').value||0,note:$('out-note').value,idempotency_key:outKey,items});localStorage.setItem('vr_last_wh',String($('out-wh').value));if($('out-carrier').value)localStorage.setItem('vr_last_carrier',$('out-carrier').value);$('out-msg').textContent='已生成单据 '+d.order_no+(d.discount_total?'（折扣 ¥'+d.discount_total+'）':'')+(d.duplicate?'（已生成过，直接返回原单）':'');showToast('已生成单据 '+d.order_no);outLines=[{wine:'',qty:1,price:'',rate:'',dprice:'',reason:''}];renderOutLines();$('out-paid').value='0';outKey=newKey();}catch(e){$('out-msg').textContent='失败：'+e.message;showToast('失败：'+e.message);}}
+async function submitOutbound(){try{const typ=$('out-type').value;if(typ==='gift'&&!$('out-cus').value)throw new Error('赠送必须选择客户');if(typ==='damage'&&!$('out-damage-reason').value.trim())throw new Error('破损必须填写破损原因');const items=outLines.filter(l=>l.wine).map((l,idx)=>{const it={wine_id:+l.wine,qty:+l.qty||0,unit_price:+(l.price||0)};if(typ==='sale'){it.orig_price=it.unit_price;const rate=(l.rate||'').toString().trim(),dp=(l.dprice||'').toString().trim();if(rate&&dp)throw new Error('第'+(idx+1)+'行折扣率和折后价只能填一个');if(rate){const r=+rate;if(!(r>0&&r<=1))throw new Error('第'+(idx+1)+'行折扣率须在 0 到 1 之间');it.discount_rate=r;}if(dp){const f=+dp;if(f<0||f>it.unit_price)throw new Error('第'+(idx+1)+'行折后价须在 0 到原价之间');it.discount_price=f;}if((rate||dp)&&!(l.reason||'').trim())throw new Error('第'+(idx+1)+'行打折需填写折扣原因');if(l.reason)it.reason=(l.reason||'').trim();}if(typ==='damage')it.reason=$('out-damage-reason').value.trim();return it;});if(!items.length)throw new Error('请先添加酒品');if(items.some(i=>i.qty<=0))throw new Error('数量必须大于 0');const d=await api('/api/outbound','POST',{type:typ,customer_id:(typ==='sale'||typ==='gift')?+$('out-cus').value:undefined,warehouse_id:+$('out-wh').value,order_date:$('out-date').value||undefined,carrier:$('out-carrier').value,tracking_no:$('out-track').value,freight:+$('out-freight').value||0,freight_free:$('out-free').checked,paid_amount:+$('out-paid').value||0,note:$('out-note').value,idempotency_key:outKey,items});localStorage.setItem('vr_last_wh',String($('out-wh').value));if($('out-carrier').value)localStorage.setItem('vr_last_carrier',$('out-carrier').value);$('out-msg').textContent='已生成单据 '+d.order_no+(d.discount_total?'（折扣 ¥'+d.discount_total+'）':'')+(d.duplicate?'（已生成过，直接返回原单）':'');showToast('已生成单据 '+d.order_no);outLines=[{wine:'',qty:1,price:'',rate:'',dprice:'',reason:''}];renderOutLines();$('out-paid').value='0';outKey=newKey();}catch(e){$('out-msg').textContent='失败：'+e.message;showToast('失败：'+e.message);}}
 async function submitTransfer(){try{const d=await api('/api/transfers','POST',{wine_id:+$('tr-wine').value,from_warehouse_id:+$('tr-from').value,to_warehouse_id:+$('tr-to').value,qty:+$('tr-qty').value,idempotency_key:trKey});$('tr-msg').textContent='调拨完成 '+d.transfer_no+(d.duplicate?'（已调拨过，直接返回原单）':'');showToast('调拨完成 '+d.transfer_no);trKey=newKey();}catch(e){$('tr-msg').textContent='失败：'+e.message;showToast('失败：'+e.message);}}
 async function loadOrders(kind){let ds;if(kind==='transfers')ds=await api('/api/transfers');else ds=await api('/api/'+kind);$('order-list').innerHTML=ds.map(o=>orderCard(kind,o)).join('')||'暂无单据';}
 function orderCard(kind,o){const no=o.order_no||o.transfer_no;const st=statusLabel(kind,o);const warn=(o.voided||o.status==='closed');const voidBtn=canVoidOrder(kind,o)?`<button class="ghost" onclick="voidOrder('${kind}',${o.id})">废单</button>`:'';if(kind==='transfers'){const confBtn=canConfirmOrder(kind,o)?`<button onclick="confirmOrder('transfers',${o.id})">确认调拨</button>`:'';return `<div class="card" id="order-card-transfers-${o.id}"><h3>${no} <span class="badge${warn?' warn':''}">${st}</span></h3><div>${o.wine_name} x${o.qty} 瓶</div><div>${o.from_warehouse_name||''} → ${o.to_warehouse_name||''}</div><p class="muted">${o.created_at||''}</p><div class="btn-pair card-actions">${confBtn}${voidBtn}</div></div>`;}
-const tlabel=o.type==='personal'?'自饮':o.type==='gift'?'赠送':o.type==='damage'?'破损':o.type==='opening'?'补登':'';const sale=o.type==='sale';const tot=o.sale_total??o.goods_total??0;const paid=o.paid_amount??0;const owed=Math.max(tot-paid,0);const isMoney=kind==='inbound'||sale;const qtyTot=(o.items||[]).reduce((a,i)=>a+i.qty,0);
+const tlabel=o.type==='personal'?'自饮':o.type==='gift'?'赠送':o.type==='damage'?'破损':o.type==='opening'?'补登':'';const sale=o.type==='sale';const custFreight=(sale&&o.freight_rule&&!o.freight_free)?(+o.freight||0):0;const tot=(o.sale_total??o.goods_total??0)+custFreight;const paid=o.paid_amount??0;const owed=Math.max(tot-paid,0);const isMoney=kind==='inbound'||sale;const qtyTot=(o.items||[]).reduce((a,i)=>a+i.qty,0);
 const itemsHtml=(o.items||[]).map(i=>{const cq=i.confirmed_qty||0;const sub=(i.qty*(i.unit_price||0)).toFixed(2);const confTxt=`（已确认 ${cq}/${i.qty}）`;if(sale&&(i.discount_amount||0)>0)return `${i.wine_name} x${i.qty}${confTxt} 原价${i.orig_price} 折后${i.unit_price} 折扣${i.discount_amount} 小计${sub}`;return `${i.wine_name} x${i.qty}${confTxt} 单价${i.unit_price} 小计${sub}`;}).join('<br>');
-const moneyLine=isMoney?(sale?`货款 ¥${tot}${o.discount_total?`（其中折扣 ¥${o.discount_total}）`:''} · 运费 ¥${o.freight} · 已付 ¥${paid} · 欠款 ¥${owed} · 状态 ${payLabel(o.pay_status)}`:`货款 ¥${tot} · 运费 ¥${o.freight} · 已付 ¥${paid} · 欠款 ¥${owed} · 状态 ${payLabel(o.pay_status)}`):`成本 ¥${o.cost_total||0}（${qtyTot} 瓶）`;
+const moneyLine=isMoney?(sale?`货款 ¥${o.sale_total}${o.discount_total?`（其中折扣 ¥${o.discount_total}）`:''} · 运费 ¥${o.freight}${o.freight_free?'（包邮，我方付）':(o.freight_payer?'（'+o.freight_payer+'付）':'（客户付）')} · 已付 ¥${paid} · 欠款 ¥${owed} · 状态 ${payLabel(o.pay_status)}`:`货款 ¥${tot} · 运费 ¥${o.freight} · 已付 ¥${paid} · 欠款 ¥${owed} · 状态 ${payLabel(o.pay_status)}`):`成本 ¥${o.cost_total||0}（${qtyTot} 瓶）`;
 const confBox=canConfirmOrder(kind,o)?`<div><h3>确认${kind==='inbound'?'到货':'出货'}</h3>${(o.items||[]).filter(x=>x.qty>(x.confirmed_qty||0)).map(x=>`<div class="line"><span>${x.wine_name}（已确认 ${x.confirmed_qty||0}/${x.qty}）</span><input class="conf-qty" data-item="${x.id}" type="number" min="1" max="${x.qty-(x.confirmed_qty||0)}" value="${x.qty-(x.confirmed_qty||0)}"></div>`).join('')}<button onclick="confirmOrderFromDetail('${kind}',${o.id})">${kind==='inbound'?'确认到货':'确认出货'}</button></div>`:'';
 const payBox=(isMoney&&!o.voided&&owed>0)?`<div class="line"><input class="pay-amt" type="number" step="0.01" placeholder="补记金额"><button class="ghost" onclick="addPay('${kind}',${o.id})">补记付款</button></div>`:'';
 const canShare=(kind==='inbound'||sale)&&!o.voided;const shareBtn=canShare?`<a href="/api/orders/${kind}/${o.id}/share.png" target="_blank" onclick="showToast('正在生成分享图…')"><button class="ghost">分享图</button></a>`:'';
@@ -296,8 +295,8 @@ function lineFinal(l){const op=+l.price||0;if($('out-type').value!=='sale')retur
 function outLineQty(i,v){outLines[i].qty=v;updateOutSummary();}
 function outLinePrice(i,v){outLines[i].price=v;updateOutSummary();}
 function delOutLine(i){outLines.splice(i,1);if(!outLines.length)outLines.push({wine:'',qty:1,price:'',rate:'',dprice:'',reason:''});renderOutLines();}
-function outCalc(){const sale=$('out-type').value==='sale';let n=0,qty=0,orig=0,disc=0;const warns=[];const discLines=[];outLines.forEach((l,idx)=>{if(!l.wine)return;n++;const q=+l.qty||0;qty+=q;const op=+l.price||0;orig+=q*op;if(q<=0)warns.push('数量必须大于 0');const av=stockAvail(+$('out-wh').value,l.wine);if(av!=null&&q>av)warns.push('库存不足：'+wineName(l.wine)+' 可用 '+av+' 瓶');if(!sale)return;const rate=(l.rate||'').toString().trim(),dp=(l.dprice||'').toString().trim();if(rate&&dp){warns.push('第'+(idx+1)+'行折扣率和折后价只能填一个');return;}let d=0;if(rate){const r=+rate;if(!(r>0&&r<=1)){warns.push('第'+(idx+1)+'行折扣率须在 0 到 1 之间');return;}d=(op-lineFinal(l))*q;}else if(dp){const f=+dp;if(f<0||f>op){warns.push('第'+(idx+1)+'行折后价须在 0 到原价之间');return;}d=(op-lineFinal(l))*q;}if(d>0){disc+=d;if(!(l.reason||'').trim())warns.push('第'+(idx+1)+'行打折需填写原因');discLines.push(wineName(l.wine)+' x'+q+' 原价'+op.toFixed(2)+' 折后'+lineFinal(l).toFixed(2)+' 折扣'+d.toFixed(2)+'（'+(l.reason||'').trim()+'）');}});const total=sale?orig-disc:0;const paid=sale?(+$('out-paid').value||0):0;return{n,qty,orig,disc,total,paid,owed:Math.max(total-paid,0),warns,sale,discLines};}
-function updateOutSummary(){const c=outCalc();const typ=$('out-type').value;const tlabel={sale:'销售',personal:'自饮',gift:'赠送',damage:'破损'}[typ];let s='';if(!c.n)s='先添加酒品';else if(c.sale){const sel=$('out-cus').selectedOptions[0];s='核对：'+tlabel+' · '+(sel?sel.textContent:'未选客户')+' · '+c.n+' 款 '+c.qty+' 瓶 · 原价 ¥'+c.orig.toFixed(2)+(c.disc?' · 折扣 ¥'+c.disc.toFixed(2):'')+' · 总金额 ¥'+c.total.toFixed(2)+' · 已收 ¥'+c.paid.toFixed(2)+' · 欠款 ¥'+c.owed.toFixed(2);if(c.discLines.length)s+='<br>'+c.discLines.join('<br>');}else{s='核对：'+tlabel+' · '+c.n+' 款 '+c.qty+' 瓶（不产生销售额和欠款）';}if(typ==='gift'&&!$('out-cus').value)c.warns.push('赠送必须选择受赠客户');if(typ==='damage'&&!$('out-damage-reason').value.trim())c.warns.push('破损必须填写破损原因');if(c.warns.length)s+='<br><span style="color:#C9362B">⚠ '+c.warns.join('；')+'</span>';const el=$('out-summary');if(el)el.innerHTML=s;const tl=$('out-total-line');if(tl)tl.innerHTML='<b>'+(c.sale?('总金额 ¥'+c.total.toFixed(2)+' · 欠款 ¥'+c.owed.toFixed(2)):tlabel+' '+c.qty+' 瓶')+'</b>';document.querySelectorAll('#out-items .line:not(.disc-line)').forEach((row,i)=>{const l=outLines[i];if(!l)return;const s2=row.querySelector('.sub');if(s2)s2.textContent='¥'+(c.sale?((+l.qty||0)*lineFinal(l)).toFixed(2):'—');});}
+function outCalc(){const sale=$('out-type').value==='sale';let n=0,qty=0,orig=0,disc=0;const warns=[];const discLines=[];outLines.forEach((l,idx)=>{if(!l.wine)return;n++;const q=+l.qty||0;qty+=q;const op=+l.price||0;orig+=q*op;if(q<=0)warns.push('数量必须大于 0');const av=stockAvail(+$('out-wh').value,l.wine);if(av!=null&&q>av)warns.push('库存不足：'+wineName(l.wine)+' 可用 '+av+' 瓶');if(!sale)return;const rate=(l.rate||'').toString().trim(),dp=(l.dprice||'').toString().trim();if(rate&&dp){warns.push('第'+(idx+1)+'行折扣率和折后价只能填一个');return;}let d=0;if(rate){const r=+rate;if(!(r>0&&r<=1)){warns.push('第'+(idx+1)+'行折扣率须在 0 到 1 之间');return;}d=(op-lineFinal(l))*q;}else if(dp){const f=+dp;if(f<0||f>op){warns.push('第'+(idx+1)+'行折后价须在 0 到原价之间');return;}d=(op-lineFinal(l))*q;}if(d>0){disc+=d;if(!(l.reason||'').trim())warns.push('第'+(idx+1)+'行打折需填写原因');discLines.push(wineName(l.wine)+' x'+q+' 原价'+op.toFixed(2)+' 折后'+lineFinal(l).toFixed(2)+' 折扣'+d.toFixed(2)+'（'+(l.reason||'').trim()+'）');}});const freight=sale?(+$('out-freight').value||0):0;const free=sale&&$('out-free').checked;const custFreight=sale&&!free?freight:0;const total=sale?orig-disc+custFreight:0;const paid=sale?(+$('out-paid').value||0):0;return{n,qty,orig,disc,total,paid,owed:Math.max(total-paid,0),warns,sale,discLines,freight,free,custFreight};}
+function updateOutSummary(){const c=outCalc();const typ=$('out-type').value;const tlabel={sale:'销售',personal:'自饮',gift:'赠送',damage:'破损'}[typ];let s='';if(!c.n)s='先添加酒品';else if(c.sale){const sel=$('out-cus').selectedOptions[0];s='核对：'+tlabel+' · '+(sel?sel.textContent:'未选客户')+' · '+c.n+' 款 '+c.qty+' 瓶 · 原价 ¥'+c.orig.toFixed(2)+(c.disc?' · 折扣 ¥'+c.disc.toFixed(2):'')+' · 运费 ¥'+c.freight.toFixed(2)+(c.free?'（包邮，我方付）':'（客户付）')+' · 总金额 ¥'+c.total.toFixed(2)+' · 已收 ¥'+c.paid.toFixed(2)+' · 欠款 ¥'+c.owed.toFixed(2);if(c.discLines.length)s+='<br>'+c.discLines.join('<br>');}else{s='核对：'+tlabel+' · '+c.n+' 款 '+c.qty+' 瓶（不产生销售额和欠款）';}if(typ==='gift'&&!$('out-cus').value)c.warns.push('赠送必须选择受赠客户');if(typ==='damage'&&!$('out-damage-reason').value.trim())c.warns.push('破损必须填写破损原因');if(c.warns.length)s+='<br><span style="color:#C9362B">⚠ '+c.warns.join('；')+'</span>';const el=$('out-summary');if(el)el.innerHTML=s;const tl=$('out-total-line');if(tl)tl.innerHTML='<b>'+(c.sale?('总金额 ¥'+c.total.toFixed(2)+' · 欠款 ¥'+c.owed.toFixed(2)):tlabel+' '+c.qty+' 瓶')+'</b>';document.querySelectorAll('#out-items .line:not(.disc-line)').forEach((row,i)=>{const l=outLines[i];if(!l)return;const s2=row.querySelector('.sub');if(s2)s2.textContent='¥'+(c.sale?((+l.qty||0)*lineFinal(l)).toFixed(2):'—');});}
 function setOutPaid(mode){if(mode==='full'){$('out-paid').value=outCalc().total.toFixed(2);}else if(mode===0){$('out-paid').value='0';}else{$('out-paid').focus();$('out-paid').select();}updateOutSummary();}
 function opStockNow(){const el=$('op-stock-now');if(!el)return;const w=+$('op-wine').value,wh=+$('op-wh').value;if(!w||!wh){el.textContent='';return;}const av=stockAvail(wh,w);el.textContent='当前库存：'+(av==null?0:av)+' 瓶（补登数量会加到这个数上）';}
 function setOpReason(v){$('op-reason').value=v;}

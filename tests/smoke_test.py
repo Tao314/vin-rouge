@@ -75,9 +75,9 @@ def main():
 
         # 1b. 版本接口公开返回 v2.5.2（期望值写死在测试里，运行时版本以 app.py 的 APP_VERSION 为准）
         s, d = req("GET", "/api/version")
-        check("版本接口 /api/version 返回 v2.6.0", s == 200 and d.get("version") == "v2.6.0", f"status={s} {d}")
+        check("版本接口 /api/version 返回 v2.7.0", s == 200 and d.get("version") == "v2.7.0", f"status={s} {d}")
         s, d = req("GET", "/api/config")
-        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.6.0" and "build_date" in d, f"status={s} {d}")
+        check("配置接口 /api/config 版本一致", s == 200 and d.get("version") == "v2.7.0" and "build_date" in d, f"status={s} {d}")
 
         # 2. 无默认用户: 首位注册前注册开放, 默认账号登录失败
         s, d = req("GET", "/api/auth/status")
@@ -266,8 +266,8 @@ def main():
 
         # 12. 补记收款后出货单变已付
         s, d = req("POST", f"/api/orders/outbound/{out_id}/payments",
-                   {"amount": 600}, token=tok)
-        check("补记收款后状态变已付",
+                   {"amount": 610}, token=tok)
+        check("补记收款 610（货款 600 + 客户付运费 10）后状态变已付",
               s == 200 and d.get("pay_status") == "paid", f"status={s} {d}")
 
         # 13. 两种分享图都是有效 PNG
@@ -1036,6 +1036,167 @@ def main():
               'orderCard(' in html and 'order-card-' in html
               and '已付清' in html and '部分付' in html and '未付' in html
               and 'pay-amt' in html, f"status={s}")
+
+        # 24. v2.7.0 运费新规则
+        # 24a. 隔离客户, 避免影响已有欠款断言
+        s, d = req("POST", "/api/customers",
+                   {"name": "运费测试客户", "phone": "13600000000"}, token=tok)
+        cus2 = d.get("id")
+        check("新建运费测试客户", s == 200 and cus2, f"status={s} {d}")
+
+        def cus2_bal():
+            s, cuss = req("GET", "/api/customers", token=tok)
+            return [c["balance"] for c in cuss if c["id"] == cus2][0]
+
+        # 24b. 进货单: 客户端仍发 freight_free/freight_payer 也被后端强制改写
+        s, d = req("POST", "/api/inbound",
+                   {"type": "purchase", "supplier_id": sup, "warehouse_id": wh1,
+                    "freight": 30, "freight_free": True, "freight_payer": "供应商",
+                    "items": [{"wine_id": wid, "qty": 1, "unit_price": 100}]},
+                   token=tok)
+        in_f = d.get("id")
+        check("进货单下单成功", s == 200 and in_f, f"status={s} {d}")
+        s, d = req("GET", f"/api/inbound/{in_f}", token=tok)
+        check("进货单运费仍为实际金额 30, 付方强制为我方",
+              d.get("freight") == 30 and d.get("freight_payer") == "我方"
+              and not d.get("freight_free"), str(d))
+
+        # 24c. 出货包邮: 运费仍是实际金额, 付方我方, 欠款只含货款
+        s, d = req("POST", "/api/outbound",
+                   {"customer_id": cus2, "warehouse_id": wh1, "freight": 25,
+                    "freight_free": True,
+                    "items": [{"wine_id": wid, "qty": 1, "unit_price": 200}]},
+                   token=tok)
+        out_free_id = d.get("id")
+        check("包邮出货单下单成功", s == 200 and out_free_id, f"status={s} {d}")
+        s, d = req("GET", f"/api/outbound/{out_free_id}", token=tok)
+        check("包邮出货单运费仍为实际金额 25, 付方为我方, 新规则标记为 1",
+              d.get("freight") == 25 and d.get("freight_payer") == "我方"
+              and d.get("freight_rule") == 1, str(d))
+        s, d = req("POST", f"/api/outbound/{out_free_id}/confirm", {}, token=tok)
+        check("包邮出货确认后状态为已出货",
+              s == 200 and d.get("status") == "shipped", f"status={s} {d}")
+        b = cus2_bal()
+        check("包邮出货确认后客户欠款 200 (只含货款, 不含运费)", b == 200, f"bal={b}")
+        s, d = req("POST", f"/api/orders/outbound/{out_free_id}/payments",
+                   {"amount": 200}, token=tok)
+        check("包邮单付 200 后已付清",
+              s == 200 and d.get("pay_status") == "paid", f"status={s} {d}")
+        b = cus2_bal()
+        check("包邮单付清后客户欠款 0", b == 0, f"bal={b}")
+
+        # 24d. 出货不包邮: 付方客户, 运费首次确认即计入欠款一次, 分批不再重复加
+        s, d = req("POST", "/api/outbound",
+                   {"customer_id": cus2, "warehouse_id": wh1, "freight": 20,
+                    "freight_free": False,
+                    "items": [{"wine_id": wid, "qty": 2, "unit_price": 200}]},
+                   token=tok)
+        out_pay_id = d.get("id")
+        check("不包邮出货单下单成功", s == 200 and out_pay_id, f"status={s} {d}")
+        s, d = req("GET", f"/api/outbound/{out_pay_id}", token=tok)
+        check("不包邮出货单运费为实际金额 20, 付方为客户",
+              d.get("freight") == 20 and d.get("freight_payer") == "客户"
+              and d.get("freight_rule") == 1, str(d))
+        item0 = d["items"][0]["id"]
+        s, d = req("POST", f"/api/outbound/{out_pay_id}/confirm",
+                   {"items": [{"item_id": item0, "qty": 1}]}, token=tok)
+        check("部分出货 1 瓶后状态为部分出货",
+              s == 200 and d.get("status") == "partial", f"status={s} {d}")
+        b = cus2_bal()
+        check("首次确认时运费已计入欠款: 部分确认后欠款 220 (货款 200 + 运费 20)",
+              b == 220, f"bal={b}")
+        s, d = req("POST", f"/api/outbound/{out_pay_id}/confirm", {}, token=tok)
+        check("剩余确认后状态为已出货",
+              s == 200 and d.get("status") == "shipped", f"status={s} {d}")
+        b = cus2_bal()
+        check("全部确认后欠款 420 (货款 400 + 运费 20, 运费未重复加)",
+              b == 420, f"bal={b}")
+        # 24d2. 老单保持原规则: 把标记改回 0 模拟 v2.7.0 之前的单
+        import sqlite3 as _sq
+        _con = _sq.connect(os.path.join(tmp, "test.db"))
+        _con.execute("UPDATE outbound_orders SET freight_rule=0 WHERE id=?",
+                     (out_pay_id,))
+        _con.commit()
+        _con.close()
+        s, d = req("GET", f"/api/outbound/{out_pay_id}", token=tok)
+        check("老单运费付方和金额保持原样",
+              d.get("freight_payer") == "客户" and d.get("freight") == 20, str(d))
+        b = cus2_bal()
+        check("老单欠款按原规则不含运费: 400", b == 400, f"bal={b}")
+        s, d = req("POST", f"/api/orders/outbound/{out_pay_id}/payments",
+                   {"amount": 400}, token=tok)
+        check("老单付 400 后已付清 (按原规则总金额 400)",
+              s == 200 and d.get("pay_status") == "paid", f"status={s} {d}")
+        b = cus2_bal()
+        check("老单付清后客户欠款 0", b == 0, f"bal={b}")
+
+        # 24e. 利润扣运费: 专用酒成本 100, 卖 300
+        s, w = req("POST", "/api/wines",
+                   {"barcode": "6901234567895", "name": "利润测试酒",
+                    "brand": "测试牌", "spec": "750ml"}, token=tok)
+        wid2 = w.get("id")
+        check("建利润测试酒", s == 200 and wid2, f"status={s} {w}")
+        s, d = req("POST", "/api/inbound",
+                   {"type": "opening", "warehouse_id": wh1,
+                    "items": [{"wine_id": wid2, "qty": 5, "unit_price": 100}]},
+                   token=tok)
+        check("利润测试酒补登 5 瓶成本 100", s == 200, f"status={s} {d}")
+        s, db = req("GET", "/api/dashboard", token=tok)
+        p0 = db.get("today_profit")
+        s, d = req("POST", "/api/outbound",
+                   {"customer_id": cus2, "warehouse_id": wh1, "freight": 25,
+                    "freight_free": True,
+                    "items": [{"wine_id": wid2, "qty": 1, "unit_price": 300}]},
+                   token=tok)
+        out_p1 = d.get("id")
+        s, d = req("POST", f"/api/outbound/{out_p1}/confirm", {}, token=tok)
+        check("包邮利润单确认成功", s == 200, f"status={s} {d}")
+        s, db = req("GET", "/api/dashboard", token=tok)
+        check("包邮单今日毛利增量 175 ((300-100)-25)",
+              round(db.get("today_profit") - p0, 2) == 175,
+              f"p0={p0} p1={db.get('today_profit')}")
+        p0 = db.get("today_profit")
+        s, d = req("POST", "/api/outbound",
+                   {"customer_id": cus2, "warehouse_id": wh1, "freight": 20,
+                    "freight_free": False,
+                    "items": [{"wine_id": wid2, "qty": 1, "unit_price": 300}]},
+                   token=tok)
+        out_p2 = d.get("id")
+        s, d = req("POST", f"/api/outbound/{out_p2}/confirm", {}, token=tok)
+        check("客户付运费单确认成功", s == 200, f"status={s} {d}")
+        s, db = req("GET", "/api/dashboard", token=tok)
+        check("客户付运费单今日毛利增量 200 (运费收支抵消)",
+              round(db.get("today_profit") - p0, 2) == 200,
+              f"p0={p0} p1={db.get('today_profit')}")
+
+        # 24f. 前端: 无重复大标题, 运费标签与提示为新文案
+        s, html = req("GET", "/")
+        check("各页无重复大标题 (登录/注册/改密标题保留)",
+              s == 200
+              and "<h2>酒库</h2>" not in html and "<h2>供应商</h2>" not in html
+              and "<h2>客户</h2>" not in html and "<h2>进货单</h2>" not in html
+              and "<h2>库存补登" not in html and "<h2>出货单</h2>" not in html
+              and "<h2>调拨</h2>" not in html and "<h2>管理</h2>" not in html
+              and "<h2>仓库管理</h2>" not in html and "<h2>库存</h2>" not in html
+              and "<h2>用户管理" not in html and "<h2>操作记录</h2>" not in html
+              and "<h2>登录</h2>" in html and "<h2>注册首位管理员</h2>" in html
+              and 'id="chpw-title"' in html, f"status={s}")
+        check("补登和用户管理说明小字还在",
+              "增加库存模式" in html and "所有管理员权限相同" in html
+              and "酒、补登、往来单位" in html, f"status={s}")
+        check("进货单表单只有实际运费, 无包邮勾选和谁付栏",
+              'id="in-freight"' in html and 'id="in-free"' not in html
+              and 'id="in-payer"' not in html
+              and "固定由我方承担，不计入供应商欠款；填 0 表示无运费。" in html
+              and "实际运费" in html, f"status={s}")
+        check("出货单表单有包邮和实际运费, 无谁付栏",
+              'id="out-free"' in html and 'id="out-freight"' in html
+              and 'id="out-payer"' not in html
+              and "填写实际物流费用；包邮表示由我方承担，并非运费为 0。" in html
+              and "我方付运费" in html, f"status={s}")
+        check("前端运费分摊逻辑在场",
+              "custFreight" in html and "客户付" in html and "我方付" in html
+              and "运费记 0" not in html, f"status={s}")
 
         # 14. audit_logs 有记录
         s, logs = req("GET", "/api/audit-logs", token=tok)
